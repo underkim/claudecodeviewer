@@ -8,6 +8,15 @@ const BADGE_COLORS = {
   rate_limit_event: '#8b949e',
   active_goal: '#8b949e',
   engine: '#f85149',
+  // These only ever come from tailing an attached session's transcript
+  // file (core/tail.js) — the durable per-session log Claude Code keeps
+  // has a different, plainer message shape than the live stream-json
+  // protocol a spawned session speaks.
+  'queue-operation': '#6e7681',
+  attachment: '#6e7681',
+  'ai-title': '#6e7681',
+  'last-prompt': '#6e7681',
+  mode: '#6e7681',
 };
 
 // Raw protocol message types that only exist to drive the live "typing"
@@ -27,7 +36,11 @@ const el = {
   newSessionForm: document.getElementById('new-session-form'),
   newSessionError: document.getElementById('new-session-error'),
   composer: document.getElementById('composer'),
+  composerText: document.querySelector('#composer [name="text"]'),
+  composerSendBtn: document.querySelector('#composer button[type="submit"]'),
   stopBtn: document.getElementById('stop-btn'),
+  discoverList: document.getElementById('discover-list'),
+  discoverRefreshBtn: document.getElementById('discover-refresh-btn'),
 };
 
 function truncate(str, n) {
@@ -81,6 +94,16 @@ function summarize(envelope) {
       if (envelope.subtype === 'exit') return `process exited (code ${raw.code}, signal ${raw.signal})`;
       if (envelope.subtype === 'stderr') return truncate(raw.text, 160);
       return truncate(raw.text || '', 160);
+    case 'queue-operation':
+      return raw.operation || '';
+    case 'attachment':
+      return `attachment: ${raw.attachment?.type || ''}`;
+    case 'ai-title':
+      return truncate(raw.aiTitle || '', 120);
+    case 'last-prompt':
+      return truncate(raw.lastPrompt || '', 120);
+    case 'mode':
+      return truncate(JSON.stringify(raw), 120);
     default:
       return truncate(JSON.stringify(raw), 160);
   }
@@ -120,7 +143,8 @@ function buildSessionItem(s) {
   if (!s.label) {
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = `${s.eventCount ?? 0} events · ${s.cwd || ''}`;
+    const suffix = s.mode === 'attached' ? ' · attached' : '';
+    meta.textContent = `${s.eventCount ?? 0} events · ${s.cwd || ''}${suffix}`;
     div.appendChild(meta);
   }
 
@@ -130,7 +154,16 @@ function buildSessionItem(s) {
 
 function updateComposerVisibility() {
   const s = state.sessions.get(state.selectedSession);
-  el.composer.hidden = !(s && s.isLive);
+  const live = !!(s && s.isLive);
+  el.composer.hidden = !live;
+  if (!live) return;
+
+  // Attached sessions are read-only: we're tailing someone else's
+  // transcript file, not holding stdin, so there's nothing to send to.
+  const attached = s.mode === 'attached';
+  el.composerText.hidden = attached;
+  el.composerSendBtn.hidden = attached;
+  el.stopBtn.textContent = attached ? 'Detach' : 'Stop';
 }
 
 async function selectSession(sessionId) {
@@ -282,6 +315,61 @@ async function loadInitialSessions() {
   renderSessionList();
 }
 
+function formatRelative(iso) {
+  const totalSeconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s ago`;
+  const minutes = Math.floor(totalSeconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+async function loadDiscoverList() {
+  const items = await window.viewerAPI.discoverSessions();
+  el.discoverList.innerHTML = '';
+
+  if (items.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'discover-empty';
+    empty.textContent = 'No other Claude Code sessions found.';
+    el.discoverList.appendChild(empty);
+    return;
+  }
+
+  for (const item of items) {
+    const div = document.createElement('div');
+    div.className = 'discover-item';
+
+    const cwd = document.createElement('div');
+    cwd.className = 'cwd';
+    cwd.textContent = item.cwd;
+    div.appendChild(cwd);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = `${item.sessionId.slice(0, 8)} · ${formatRelative(item.lastModified)}`;
+    div.appendChild(meta);
+
+    div.addEventListener('click', () => attachToDiscovered(item));
+    el.discoverList.appendChild(div);
+  }
+}
+
+async function attachToDiscovered(item) {
+  const data = await window.viewerAPI.attachSession(item);
+  state.sessions.set(data.sessionId, {
+    sessionId: data.sessionId,
+    cwd: item.cwd,
+    eventCount: 0,
+    createdAt: new Date().toISOString(),
+    isLive: true,
+    mode: 'attached',
+  });
+  await selectSession(data.sessionId);
+  loadDiscoverList();
+}
+
 el.newSessionForm.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   el.newSessionError.textContent = '';
@@ -307,6 +395,7 @@ el.newSessionForm.addEventListener('submit', async (ev) => {
       eventCount: 0,
       createdAt: new Date().toISOString(),
       isLive: true,
+      mode: 'spawned',
     });
     el.newSessionForm.querySelector('[name="prompt"]').value = '';
     await selectSession(data.sessionId);
@@ -334,9 +423,17 @@ el.composer.addEventListener('submit', async (ev) => {
 
 el.stopBtn.addEventListener('click', async () => {
   if (state.selectedSession === ALL_SESSIONS) return;
-  await window.viewerAPI.stopSession(state.selectedSession);
+  const s = state.sessions.get(state.selectedSession);
+  if (s && s.mode === 'attached') {
+    await window.viewerAPI.detachSession(state.selectedSession);
+  } else {
+    await window.viewerAPI.stopSession(state.selectedSession);
+  }
 });
 
+el.discoverRefreshBtn.addEventListener('click', loadDiscoverList);
+
 loadInitialSessions();
+loadDiscoverList();
 renderSessionList();
 window.viewerAPI.onEvent(handleLiveEvent);

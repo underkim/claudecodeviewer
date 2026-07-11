@@ -6,6 +6,9 @@ contextBridge.exposeInMainWorld('viewerAPI', {
   createSession: (params) => ipcRenderer.invoke('sessions:create', params),
   sendMessage: (sessionId, text) => ipcRenderer.invoke('sessions:message', { sessionId, text }),
   stopSession: (sessionId) => ipcRenderer.invoke('sessions:stop', { sessionId }),
+  discoverSessions: () => ipcRenderer.invoke('sessions:discover'),
+  attachSession: (params) => ipcRenderer.invoke('sessions:attach', params),
+  detachSession: (sessionId) => ipcRenderer.invoke('sessions:detach', { sessionId }),
   pickDirectory: () => ipcRenderer.invoke('dialog:pickDirectory'),
   onEvent(callback) {
     const listener = (_event, envelope) => callback(envelope);

@@ -38,6 +38,21 @@ SQLite (core/db.js)
    `window.viewerAPI` (`electron/preload.cjs`), an IPC bridge with no
    direct Node or OS access.
 
+### Watching a session you didn't launch from the app
+
+The app can also attach to a Claude Code session already running
+somewhere else — a terminal, another tool, anywhere on the same machine —
+without having spawned it. Claude Code keeps a live, append-only
+transcript for every session at
+`~/.claude/projects/<cwd, slashes as hyphens>/<session_id>.jsonl`;
+`core/discover.js` scans that directory for transcripts (most recently
+modified first), and `core/tail.js` reads a chosen one from the start and
+then follows new lines as Claude Code appends them — the same idea as
+`tail -f`, with no dependency on who started the process. Click "Attach
+to a running session" in the app, pick one, and it streams in exactly
+like a spawned session, just read-only: there's no stdin to send
+follow-up turns into, since the app isn't that session's parent process.
+
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full message reference
 — it documents Claude Code's actual protocol, captured from a real run,
 not a schema invented on top of it.
@@ -53,6 +68,10 @@ This opens the app window. Fill in a working directory (or use Browse…)
 and a prompt in the "New session" panel, and hit Launch. The session's
 output streams in live; use the composer at the bottom to send follow-up
 turns, or Stop to end it.
+
+To watch a session running somewhere else instead, use "Attach to a
+running session" in the sidebar — Refresh to list recently active Claude
+Code sessions on this machine, and click one to start tailing it.
 
 Requires the `claude` CLI to be installed and on `PATH` (or set
 `CLAUDE_VIEWER_CLAUDE_BIN` to its full path). SQLite history is stored

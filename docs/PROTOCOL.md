@@ -88,6 +88,53 @@ namespaced so it's never confused with Claude Code's own protocol:
 about the child process (it exited, it wrote to stderr, a line failed to
 parse).
 
+## Second transport: tailing a transcript file (for sessions we didn't spawn)
+
+The stream-json pipe above only exists for sessions the app itself
+launched — it requires being the parent process. To watch a session
+started elsewhere (a terminal, another tool), the app instead reads the
+durable transcript Claude Code keeps for *every* session, regardless of
+what started it, at:
+
+```
+~/.claude/projects/<cwd, every "/" replaced with "-">/<session_id>.jsonl
+```
+
+`core/discover.js` scans that directory (most recently modified first) so
+the app can offer a picker instead of requiring a path; `core/tail.js`
+reads a chosen transcript from byte 0 (backfilling everything Claude Code
+has logged so far) and then watches the file for further writes, parsing
+each newly appended line the moment it lands — the same idea as `tail
+-f`, implemented with `fs.watch` plus an open byte offset rather than a
+subprocess.
+
+This transcript format is **not** the same shape as the stream-json
+protocol above — it's Claude Code's own persisted log, with a different
+message-type vocabulary (captured from a real transcript, again not
+invented):
+
+| `type`              | Meaning |
+|----------------------|---------|
+| `user` / `assistant`  | Same inner shape as the stream-json `user`/`assistant` messages — `message.content` blocks (`text`, `tool_use`, `tool_result`) — so the renderer's existing rendering code handles both transports without special-casing |
+| `queue-operation`     | A turn was enqueued/dequeued for processing |
+| `attachment`          | Auxiliary context attached to a turn (skills, agents, deferred tools) |
+| `ai-title`            | An auto-generated short title for the session |
+| `last-prompt`         | The most recent prompt text, kept for quick lookup |
+| `mode`                | A mode/permission-state change |
+
+There is no `stream_event` (no token-level granularity — entries appear
+once Claude Code writes them, not as they're generated) and no `result`
+turn summary; the envelope's `type`/`subtype` fields and `raw` passthrough
+work exactly the same way as the stream-json transport, so storage,
+broadcasting, and rendering are shared code (`ingest()` in
+`electron/main.cjs` doesn't care which transport produced a message).
+
+Attached sessions are **read-only**: there's no stdin to write into,
+since the app isn't the parent process, so `sessions:message` and
+`sessions:stop` reject a `sessionId` that was attached rather than
+spawned (`sessions:detach` just stops watching the file — it never
+touches the underlying `claude` process either way).
+
 ## IPC surface (Electron main process ↔ renderer)
 
 This app is a desktop app, not a client/server pair over a network port.
@@ -107,6 +154,13 @@ touches the network or the filesystem itself — it only calls the API
   to the child.
 - `viewerAPI.listSessions()` / `viewerAPI.getSessionEvents(sessionId)` →
   `sessions:list` / `sessions:events` — history, backed by SQLite.
+- `viewerAPI.discoverSessions()` → `sessions:discover` — scans
+  `~/.claude/projects` for transcripts not already being tracked (see
+  below), most recently modified first.
+- `viewerAPI.attachSession({ sessionId, transcriptPath, cwd })` →
+  `sessions:attach` — starts tailing an existing transcript file.
+- `viewerAPI.detachSession(sessionId)` → `sessions:detach` — stops
+  tailing it (does not touch the underlying `claude` process).
 - `viewerAPI.pickDirectory()` → `dialog:pickDirectory` — native OS folder
   picker for choosing a project directory.
 - `viewerAPI.onEvent(callback)` — subscribes to `viewer:event`, which the

@@ -8,9 +8,13 @@ const crypto = require('node:crypto');
 // in with a dynamic import instead.
 let db;
 let engine;
+let tail;
+let discover;
 
 /** @type {Map<string, { engine: ReturnType<typeof engine.launchSession>, cwd: string }>} */
 const liveSessions = new Map();
+/** @type {Map<string, { tail: ReturnType<typeof tail.attachToTranscript>, cwd: string }>} */
+const attachedSessions = new Map();
 let mainWindow;
 
 function broadcast(envelope) {
@@ -51,6 +55,8 @@ function createWindow() {
 app.whenReady().then(async () => {
   db = await import('../core/db.js');
   engine = await import('../core/engine.js');
+  tail = await import('../core/tail.js');
+  discover = await import('../core/discover.js');
 
   createWindow();
   app.on('activate', () => {
@@ -60,11 +66,46 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   for (const live of liveSessions.values()) live.engine.stop();
+  for (const attached of attachedSessions.values()) attached.tail.detach();
   if (process.platform !== 'darwin') app.quit();
 });
 
 ipcMain.handle('sessions:list', () => {
-  return db.listSessions().map((s) => ({ ...s, isLive: liveSessions.has(s.sessionId) }));
+  return db.listSessions().map((s) => ({
+    ...s,
+    isLive: liveSessions.has(s.sessionId) || attachedSessions.has(s.sessionId),
+  }));
+});
+
+ipcMain.handle('sessions:discover', () => {
+  return discover
+    .discoverSessions()
+    .filter((s) => !liveSessions.has(s.sessionId) && !attachedSessions.has(s.sessionId));
+});
+
+ipcMain.handle('sessions:attach', (_event, { sessionId, transcriptPath, cwd }) => {
+  if (liveSessions.has(sessionId) || attachedSessions.has(sessionId)) {
+    throw new Error('already tracking this session');
+  }
+
+  db.createSession({ sessionId, cwd, source: 'attached' });
+
+  const handle = tail.attachToTranscript(transcriptPath, {
+    onMessage(msg) { ingest(sessionId, msg); },
+    onError(err) { ingest(sessionId, { type: 'engine', subtype: 'stderr', text: String(err) }); },
+  });
+  attachedSessions.set(sessionId, { tail: handle, cwd });
+
+  return { sessionId };
+});
+
+ipcMain.handle('sessions:detach', (_event, { sessionId }) => {
+  const attached = attachedSessions.get(sessionId);
+  if (!attached) throw new Error('session is not attached');
+  attached.tail.detach();
+  attachedSessions.delete(sessionId);
+  db.endSession(sessionId);
+  return { ok: true };
 });
 
 ipcMain.handle('sessions:events', (_event, sessionId) => db.listEventsForSession(sessionId));
@@ -89,7 +130,7 @@ ipcMain.handle('sessions:create', (_event, { cwd, prompt, model, permissionMode 
         if (!sessionId && msg.session_id) {
           sessionId = msg.session_id;
           liveSessions.set(sessionId, { engine: eng, cwd });
-          db.createSession({ sessionId, cwd, model, permissionMode });
+          db.createSession({ sessionId, cwd, model, permissionMode, source: 'spawned' });
           if (!settled) {
             settled = true;
             clearTimeout(timer);
@@ -117,14 +158,14 @@ ipcMain.handle('sessions:create', (_event, { cwd, prompt, model, permissionMode 
 
 ipcMain.handle('sessions:message', (_event, { sessionId, text }) => {
   const live = liveSessions.get(sessionId);
-  if (!live) throw new Error('session is not live');
+  if (!live) throw new Error('session was not launched by this app, so it has no stdin to write to');
   live.engine.send(text);
   return { ok: true };
 });
 
 ipcMain.handle('sessions:stop', (_event, { sessionId }) => {
   const live = liveSessions.get(sessionId);
-  if (!live) throw new Error('session is not live');
+  if (!live) throw new Error('session was not launched by this app, so there is no process to stop');
   live.engine.stop();
   return { ok: true };
 });
