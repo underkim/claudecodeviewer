@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -7,8 +7,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = process.env.CLAUDE_VIEWER_DB || path.join(__dirname, '..', 'data', 'events.db');
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
-export const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+// node:sqlite is built into Node/Electron itself — no native addon to
+// compile, so no NODE_MODULE_VERSION mismatch between the system Node
+// used for `npm install` and the Node version Electron bundles.
+export const db = new DatabaseSync(DB_PATH);
+db.exec('PRAGMA journal_mode = WAL');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS sessions (

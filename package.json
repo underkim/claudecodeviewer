@@ -5,15 +5,10 @@
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
-    "postinstall": "electron-rebuild -f -w better-sqlite3",
     "start": "electron ."
   },
   "license": "MIT",
-  "dependencies": {
-    "better-sqlite3": "^11.3.0"
-  },
   "devDependencies": {
-    "@electron/rebuild": "^4.2.0",
     "electron": "^43.1.0"
   }
 }
