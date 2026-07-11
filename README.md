@@ -49,6 +49,13 @@ npm install
 npm start
 ```
 
+`npm install` also rebuilds `better-sqlite3` against Electron's own Node
+ABI via a `postinstall` hook (`electron-rebuild`) — a plain `npm install`
+compiles native modules against your system Node, which has a different
+ABI than the one bundled in Electron, so without this step the app fails
+at startup with an `NODE_MODULE_VERSION` mismatch. If you ever see that
+error, re-run `npx electron-rebuild -f -w better-sqlite3`.
+
 This opens the app window. Fill in a working directory (or use Browse…)
 and a prompt in the "New session" panel, and hit Launch. The session's
 output streams in live; use the composer at the bottom to send follow-up
