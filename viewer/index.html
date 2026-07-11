@@ -10,31 +10,11 @@
     <header>
       <span class="status-dot connected" id="status-dot"></span>
       <h1>Claude Code Viewer</h1>
-      <span id="status-text">ready</span>
+      <span id="status-text">view-only</span>
+      <button type="button" id="settings-btn" title="Global settings">⚙ Settings</button>
     </header>
 
     <nav id="sidebar">
-      <form id="new-session-form">
-        <div class="form-title">New session</div>
-        <div class="form-row">
-          <input name="cwd" placeholder="Working directory (cwd)" required />
-          <button type="button" id="browse-btn">Browse…</button>
-        </div>
-        <textarea name="prompt" placeholder="Initial prompt" rows="3" required></textarea>
-        <div class="form-row">
-          <input name="model" placeholder="model (optional)" />
-          <select name="permissionMode">
-            <option value="">permission: default</option>
-            <option value="plan">plan</option>
-            <option value="acceptEdits">acceptEdits</option>
-            <option value="dontAsk">dontAsk</option>
-            <option value="bypassPermissions">bypassPermissions</option>
-          </select>
-        </div>
-        <button type="submit">Launch</button>
-        <div id="new-session-error" class="form-error"></div>
-      </form>
-
       <div id="discover-panel">
         <div class="form-title-row">
           <span class="form-title">Attach to a running session</span>
@@ -49,15 +29,27 @@
     <div id="timeline-wrap">
       <div id="dashboard"></div>
 
+      <div id="settings-panel" hidden>
+        <div class="settings-head">
+          <span class="form-title">Global settings</span>
+          <span id="settings-path"></span>
+        </div>
+        <textarea id="settings-editor" spellcheck="false"></textarea>
+        <div class="settings-actions">
+          <button type="button" id="settings-reload-btn">Reload</button>
+          <button type="button" id="settings-save-btn">Save</button>
+          <span id="settings-status"></span>
+        </div>
+      </div>
+
       <div id="detail-header" hidden>
         <button type="button" id="back-to-dashboard">← Dashboard</button>
         <span id="detail-title"></span>
       </div>
       <main id="timeline" hidden></main>
       <form id="composer" hidden>
-        <input name="text" placeholder="Send a follow-up message to this session…" autocomplete="off" />
-        <button type="submit">Send</button>
-        <button type="button" id="stop-btn">Stop</button>
+        <span class="composer-note">Read-only — attached to this session's transcript</span>
+        <button type="button" id="detach-btn">Detach</button>
       </form>
     </div>
   </div>

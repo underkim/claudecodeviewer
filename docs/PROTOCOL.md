@@ -1,71 +1,63 @@
-# Claude Code Viewer — Protocol v2
+# Claude Code Viewer — Protocol
 
-v1 of this document specified a protocol we invented ourselves: a hook
-script that Claude Code ran as a subprocess per lifecycle event, POSTing
-JSON to a server over HTTP. That worked, but it wasn't really a contract
-*with* Claude Code — it was a workaround built entirely on our side, one
-HTTP round trip per event, one-way, and unable to see anything happening
-between hook boundaries (streamed text, partial tool input, etc).
+This app is **read-only**: it never spawns a `claude` process or writes
+anything to a session's input. Everything it shows comes from reading
+files Claude Code already writes on its own — the per-session transcript
+for session data, and `~/.claude/settings.json` for the settings editor
+(reads to populate the editor; writes only when you explicitly hit Save).
 
-v2 drops that layer. Claude Code already exposes a real, bidirectional,
-documented protocol for exactly this purpose — the same one the Claude
-Agent SDK is built on — and this viewer now speaks it directly.
+An earlier version spoke Claude Code's `stream-json` child-process
+protocol directly (the same one the Claude Agent SDK uses) to launch and
+drive sessions from the app. That capability was deliberately removed —
+this app doesn't instruct Claude Code, only watches it — so that protocol
+isn't documented here anymore; what follows is what the app actually
+reads today.
 
-## Transport: the `claude` CLI itself
+## Transport: tailing a transcript file
 
-The Electron main process spawns `claude` as a child process:
+Claude Code keeps a durable, append-only transcript for **every**
+session, regardless of what started it, at:
 
 ```
-claude --print \
-  --input-format stream-json \
-  --output-format stream-json \
-  --verbose \
-  --include-partial-messages \
-  [--model <model>] \
-  [--permission-mode <mode>]
+~/.claude/projects/<cwd, every "/" replaced with "-">/<session_id>.jsonl
 ```
 
-- **stdin**: newline-delimited JSON. Each line is one conversational turn:
-  ```json
-  {"type":"user","message":{"role":"user","content":[{"type":"text","text":"..."}]}}
-  ```
-  The process is kept alive between turns — sending another line on stdin
-  continues the same session, same conversation.
-- **stdout**: newline-delimited JSON. Every message Claude Code emits about
-  its own execution — not just tool calls, but token-level streaming,
-  hook lifecycle, rate limits, turn results — comes through here, verbatim,
-  as it happens.
+- `core/discover.js` scans that directory (most recently modified first)
+  so the app can offer a picker instead of requiring a path. It peeks at
+  the first ~8KB of each file for a `cwd` field (real value) rather than
+  trying to decode it from the hyphen-joined directory name (lossy if the
+  real path contains hyphens).
+- `core/tail.js` reads a chosen transcript from byte 0 — backfilling
+  everything Claude Code has logged so far — and then watches the file
+  for further writes (`fs.watch` + a tracked byte offset), parsing each
+  newly appended line the moment it lands. Same idea as `tail -f`,
+  implemented without a subprocess. There is no way to write back into
+  the file or the session — attaching is purely observational.
 
-This is a single persistent pipe per session: the main process *is* the
-parent process, so it knows the session's progress by construction, not
-by inference from a side channel.
+## Message types in the transcript
 
-## Message types observed on stdout
+Captured from a real transcript, not invented:
 
-These are Claude Code's own message types (captured directly from a real
-`claude -p --output-format stream-json` run — this is not a schema we
-made up):
+| `type`              | Meaning |
+|----------------------|---------|
+| `user` / `assistant`  | `message.content` blocks (`text`, `tool_use`, `tool_result`) — the actual conversation and tool activity |
+| `queue-operation`     | A turn was enqueued/dequeued for processing |
+| `attachment`          | Auxiliary context attached to a turn (skills, agents, deferred tools) |
+| `ai-title`            | An auto-generated short title for the session |
+| `last-prompt`         | The most recent prompt text, kept for quick lookup |
+| `mode`                | A mode/permission-state change |
+| `system`              | Occasional session-level notes (subtype varies) |
 
-| `type`             | `subtype`                              | Meaning |
-|--------------------|-----------------------------------------|---------|
-| `system`            | `init`                                   | Session started: `session_id`, `cwd`, `model`, `tools`, `permissionMode` |
-| `system`            | `status`                                 | Lightweight state change (`requesting`, `responding`, …) |
-| `system`            | `hook_started` / `hook_response`         | A project hook fired as part of this turn (`hook_name`, `exit_code`, `stdout`/`stderr`) |
-| `system`            | `post_turn_summary`                      | Short human-readable recap of what just happened |
-| `stream_event`      | —                                        | Wraps a raw Anthropic API streaming event (`message_start`, `content_block_delta` with `text_delta`/`input_json_delta`, `content_block_stop`, `message_delta`, `message_stop`) — token-by-token output |
-| `assistant`         | —                                        | A complete assistant message for this turn (text and/or `tool_use` blocks), superseding the partial `stream_event`s that built up to it |
-| `user`              | —                                        | A synthetic "user" turn Claude Code feeds back to itself carrying `tool_result` content |
-| `result`            | `success` / `error_*`                    | Turn finished: final `result` text, `duration_ms`, `total_cost_usd`, `usage`, `permission_denials` |
-| `rate_limit_event`  | —                                        | Rate-limit status snapshot |
-| `active_goal`       | —                                        | The active `/goal` condition, if any |
-
-Every message carries `session_id`, so the main process never has to
-wait for a specific message to learn which session an event belongs to —
-the very first line already has it.
+There's no token-level granularity here (entries appear once Claude Code
+writes them, not as they're generated) and no explicit "turn result"
+message — the dashboard's activity line (`Running <tool>`, `Thinking…`,
+`Idle`, `Session ended`) is derived client-side from whichever of these
+messages arrived most recently (see `deriveActivity()` in
+`viewer/app.js`), not read directly off the wire.
 
 ## Envelope stored in SQLite / sent to the renderer
 
-The main process wraps each raw message before storing/forwarding it:
+The main process wraps each raw transcript line before storing/forwarding it:
 
 ```jsonc
 {
@@ -75,105 +67,41 @@ The main process wraps each raw message before storing/forwarding it:
   "receivedAt": "2026-07-11T05:20:00.000Z",
   "type": "assistant",         // raw.type, passed through
   "subtype": null,             // raw.subtype, passed through (often null)
-  "raw": { /* the exact parsed stdout line, untouched */ }
+  "raw": { /* the exact parsed transcript line, untouched */ }
 }
 ```
 
 `raw` is never reshaped — new fields Claude Code adds show up immediately
-without a code change.
-
-One synthetic type is added by the main process itself, clearly
-namespaced so it's never confused with Claude Code's own protocol:
-`engine` (`subtype`: `exit`, `stderr`, `unparsed_stdout`) — bookkeeping
-about the child process (it exited, it wrote to stderr, a line failed to
-parse).
-
-## Second transport: tailing a transcript file (for sessions we didn't spawn)
-
-The stream-json pipe above only exists for sessions the app itself
-launched — it requires being the parent process. To watch a session
-started elsewhere (a terminal, another tool), the app instead reads the
-durable transcript Claude Code keeps for *every* session, regardless of
-what started it, at:
-
-```
-~/.claude/projects/<cwd, every "/" replaced with "-">/<session_id>.jsonl
-```
-
-`core/discover.js` scans that directory (most recently modified first) so
-the app can offer a picker instead of requiring a path; `core/tail.js`
-reads a chosen transcript from byte 0 (backfilling everything Claude Code
-has logged so far) and then watches the file for further writes, parsing
-each newly appended line the moment it lands — the same idea as `tail
--f`, implemented with `fs.watch` plus an open byte offset rather than a
-subprocess.
-
-This transcript format is **not** the same shape as the stream-json
-protocol above — it's Claude Code's own persisted log, with a different
-message-type vocabulary (captured from a real transcript, again not
-invented):
-
-| `type`              | Meaning |
-|----------------------|---------|
-| `user` / `assistant`  | Same inner shape as the stream-json `user`/`assistant` messages — `message.content` blocks (`text`, `tool_use`, `tool_result`) — so the renderer's existing rendering code handles both transports without special-casing |
-| `queue-operation`     | A turn was enqueued/dequeued for processing |
-| `attachment`          | Auxiliary context attached to a turn (skills, agents, deferred tools) |
-| `ai-title`            | An auto-generated short title for the session |
-| `last-prompt`         | The most recent prompt text, kept for quick lookup |
-| `mode`                | A mode/permission-state change |
-
-There is no `stream_event` (no token-level granularity — entries appear
-once Claude Code writes them, not as they're generated) and no `result`
-turn summary; the envelope's `type`/`subtype` fields and `raw` passthrough
-work exactly the same way as the stream-json transport, so storage,
-broadcasting, and rendering are shared code (`ingest()` in
-`electron/main.cjs` doesn't care which transport produced a message).
-
-Attached sessions are **read-only**: there's no stdin to write into,
-since the app isn't the parent process, so `sessions:message` and
-`sessions:stop` reject a `sessionId` that was attached rather than
-spawned (`sessions:detach` just stops watching the file — it never
-touches the underlying `claude` process either way).
+without a code change. One synthetic type is added by the main process
+itself, clearly namespaced so it's never confused with something Claude
+Code wrote: `engine` (`subtype`: `exit`, `stderr`, `unparsed_stdout`) —
+bookkeeping about the file watcher itself (an error reading the file, a
+line that failed to parse).
 
 ## IPC surface (Electron main process ↔ renderer)
 
-This app is a desktop app, not a client/server pair over a network port.
-The main process (`electron/main.cjs`) owns the `claude` child processes
-directly; the renderer (`viewer/`, running in a `BrowserWindow`) never
-touches the network or the filesystem itself — it only calls the API
+The main process (`electron/main.cjs`) owns all filesystem access; the
+renderer (`viewer/`, running in a `BrowserWindow`) only calls the API
 `electron/preload.cjs` exposes on `window.viewerAPI`, which forwards to
 `ipcMain.handle` channels in the main process:
 
-- `viewerAPI.createSession({ cwd, prompt, model?, permissionMode? })` →
-  `sessions:create` — spawns a new `claude` child process in `cwd`, sends
-  `prompt` as the first turn, resolves `{ sessionId }` once Claude Code
-  reports its own session id.
-- `viewerAPI.sendMessage(sessionId, text)` → `sessions:message` — writes
-  another turn to a live session's stdin.
-- `viewerAPI.stopSession(sessionId)` → `sessions:stop` — sends `SIGTERM`
-  to the child.
-- `viewerAPI.listSessions()` / `viewerAPI.getSessionEvents(sessionId)` →
-  `sessions:list` / `sessions:events` — history, backed by SQLite.
 - `viewerAPI.discoverSessions()` → `sessions:discover` — scans
-  `~/.claude/projects` for transcripts not already being tracked (see
-  below), most recently modified first.
+  `~/.claude/projects` for transcripts not already being tracked, most
+  recently modified first.
 - `viewerAPI.attachSession({ sessionId, transcriptPath, cwd })` →
   `sessions:attach` — starts tailing an existing transcript file.
 - `viewerAPI.detachSession(sessionId)` → `sessions:detach` — stops
-  tailing it (does not touch the underlying `claude` process).
-- `viewerAPI.pickDirectory()` → `dialog:pickDirectory` — native OS folder
-  picker for choosing a project directory.
+  tailing it (the underlying Claude Code session, if still running, is
+  never touched).
+- `viewerAPI.listSessions()` / `viewerAPI.getSessionEvents(sessionId)` →
+  `sessions:list` / `sessions:events` — history, backed by SQLite.
+- `viewerAPI.readSettings()` → `settings:read` — reads
+  `~/.claude/settings.json`, returning `{ path, contents, exists }`
+  (`contents` is `"{}\n"` and `exists: false` if the file doesn't exist
+  yet).
+- `viewerAPI.writeSettings(contents)` → `settings:write` — validates
+  `contents` parses as a JSON object, then writes it verbatim; rejects
+  (and writes nothing) if it doesn't parse or isn't an object.
 - `viewerAPI.onEvent(callback)` — subscribes to `viewer:event`, which the
   main process pushes (`mainWindow.webContents.send`) for every new
-  message as it's ingested, no polling involved.
-
-## A note on environment isolation
-
-`claude` reads several `CLAUDE_CODE_*` environment variables to attach to
-an existing session (useful when Claude Code re-execs itself, harmful
-here). The main process explicitly strips `CLAUDE_CODE_SESSION_ID`,
-`CLAUDE_CODE_REMOTE_SESSION_ID`, and `CLAUDE_CODE_CHILD_SESSION` from the
-child's environment before spawning (`core/engine.js`) — otherwise, if
-the viewer app itself happens to be launched from inside a Claude Code
-session, every session it launches would silently attach to *that* one
-instead of starting its own.
+  transcript line as it's ingested, no polling involved.

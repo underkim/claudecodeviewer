@@ -17,9 +17,6 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     cwd TEXT,
-    model TEXT,
-    permission_mode TEXT,
-    source TEXT NOT NULL DEFAULT 'spawned',
     created_at TEXT NOT NULL,
     ended_at TEXT
   );
@@ -35,17 +32,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_events_session ON events (session_id, received_at);
 `);
 
-// CREATE TABLE IF NOT EXISTS leaves an already-existing sessions table
-// (from a build before the `source` column existed) untouched, so add it
-// separately for anyone with a pre-existing local data/events.db.
-const hasSourceColumn = db.prepare(`PRAGMA table_info(sessions)`).all().some((c) => c.name === 'source');
-if (!hasSourceColumn) {
-  db.exec(`ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'spawned'`);
-}
-
 const upsertSessionStmt = db.prepare(`
-  INSERT INTO sessions (session_id, cwd, model, permission_mode, source, created_at)
-  VALUES (@sessionId, @cwd, @model, @permissionMode, @source, @createdAt)
+  INSERT INTO sessions (session_id, cwd, created_at)
+  VALUES (@sessionId, @cwd, @createdAt)
   ON CONFLICT(session_id) DO NOTHING
 `);
 
@@ -58,13 +47,10 @@ const insertEventStmt = db.prepare(`
   VALUES (@eventId, @sessionId, @msgType, @msgSubtype, @receivedAt, @payload)
 `);
 
-export function createSession({ sessionId, cwd, model, permissionMode, source }) {
+export function createSession({ sessionId, cwd }) {
   upsertSessionStmt.run({
     sessionId,
     cwd: cwd ?? null,
-    model: model ?? null,
-    permissionMode: permissionMode ?? null,
-    source: source ?? 'spawned',
     createdAt: new Date().toISOString(),
   });
 }
@@ -101,9 +87,6 @@ export function listSessions() {
     SELECT
       s.session_id AS sessionId,
       s.cwd,
-      s.model,
-      s.permission_mode AS permissionMode,
-      s.source,
       s.created_at AS createdAt,
       s.ended_at AS endedAt,
       (SELECT COUNT(*) FROM events e WHERE e.session_id = s.session_id) AS eventCount,

@@ -1,18 +1,17 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 const crypto = require('node:crypto');
 
-// core/db.js and core/engine.js are ES modules (root package.json sets
-// "type": "module"); this file stays CommonJS so Electron's preload/main
-// loading never has to guess which module system applies, and pulls them
-// in with a dynamic import instead.
+// core/db.js, core/tail.js, core/discover.js are ES modules (root
+// package.json sets "type": "module"); this file stays CommonJS so
+// Electron's preload/main loading never has to guess which module system
+// applies, and pulls them in with a dynamic import instead.
 let db;
-let engine;
 let tail;
 let discover;
 
-/** @type {Map<string, { engine: ReturnType<typeof engine.launchSession>, cwd: string }>} */
-const liveSessions = new Map();
 /** @type {Map<string, { tail: ReturnType<typeof tail.attachToTranscript>, cwd: string }>} */
 const attachedSessions = new Map();
 let mainWindow;
@@ -54,7 +53,6 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   db = await import('../core/db.js');
-  engine = await import('../core/engine.js');
   tail = await import('../core/tail.js');
   discover = await import('../core/discover.js');
 
@@ -65,30 +63,24 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  for (const live of liveSessions.values()) live.engine.stop();
   for (const attached of attachedSessions.values()) attached.tail.detach();
   if (process.platform !== 'darwin') app.quit();
 });
 
 ipcMain.handle('sessions:list', () => {
-  return db.listSessions().map((s) => ({
-    ...s,
-    isLive: liveSessions.has(s.sessionId) || attachedSessions.has(s.sessionId),
-  }));
+  return db.listSessions().map((s) => ({ ...s, isLive: attachedSessions.has(s.sessionId) }));
 });
 
 ipcMain.handle('sessions:discover', () => {
-  return discover
-    .discoverSessions()
-    .filter((s) => !liveSessions.has(s.sessionId) && !attachedSessions.has(s.sessionId));
+  return discover.discoverSessions().filter((s) => !attachedSessions.has(s.sessionId));
 });
 
 ipcMain.handle('sessions:attach', (_event, { sessionId, transcriptPath, cwd }) => {
-  if (liveSessions.has(sessionId) || attachedSessions.has(sessionId)) {
+  if (attachedSessions.has(sessionId)) {
     throw new Error('already tracking this session');
   }
 
-  db.createSession({ sessionId, cwd, source: 'attached' });
+  db.createSession({ sessionId, cwd });
 
   const handle = tail.attachToTranscript(transcriptPath, {
     onMessage(msg) { ingest(sessionId, msg); },
@@ -110,68 +102,31 @@ ipcMain.handle('sessions:detach', (_event, { sessionId }) => {
 
 ipcMain.handle('sessions:events', (_event, sessionId) => db.listEventsForSession(sessionId));
 
-ipcMain.handle('sessions:create', (_event, { cwd, prompt, model, permissionMode }) => {
-  return new Promise((resolve, reject) => {
-    let sessionId = null;
-    let settled = false;
+function globalSettingsPath() {
+  return path.join(os.homedir(), '.claude', 'settings.json');
+}
 
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        reject(new Error('Timed out waiting for Claude Code to start'));
-      }
-    }, 20000);
-
-    const eng = engine.launchSession({
-      cwd,
-      model,
-      permissionMode,
-      onMessage(msg) {
-        if (!sessionId && msg.session_id) {
-          sessionId = msg.session_id;
-          liveSessions.set(sessionId, { engine: eng, cwd });
-          db.createSession({ sessionId, cwd, model, permissionMode, source: 'spawned' });
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            resolve({ sessionId });
-          }
-        }
-        if (sessionId) ingest(sessionId, msg);
-      },
-      onExit({ code, signal }) {
-        if (sessionId) {
-          db.endSession(sessionId);
-          liveSessions.delete(sessionId);
-          ingest(sessionId, { type: 'engine', subtype: 'exit', code, signal });
-        } else if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          reject(new Error(`Claude Code exited before starting a session (code ${code}, signal ${signal})`));
-        }
-      },
-    });
-
-    eng.send(prompt);
-  });
+ipcMain.handle('settings:read', () => {
+  const settingsPath = globalSettingsPath();
+  if (!fs.existsSync(settingsPath)) {
+    return { path: settingsPath, contents: '{}\n', exists: false };
+  }
+  return { path: settingsPath, contents: fs.readFileSync(settingsPath, 'utf8'), exists: true };
 });
 
-ipcMain.handle('sessions:message', (_event, { sessionId, text }) => {
-  const live = liveSessions.get(sessionId);
-  if (!live) throw new Error('session was not launched by this app, so it has no stdin to write to');
-  live.engine.send(text);
-  return { ok: true };
-});
+ipcMain.handle('settings:write', (_event, contents) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(contents);
+  } catch (err) {
+    throw new Error(`Invalid JSON: ${err.message}`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('Settings must be a JSON object');
+  }
 
-ipcMain.handle('sessions:stop', (_event, { sessionId }) => {
-  const live = liveSessions.get(sessionId);
-  if (!live) throw new Error('session was not launched by this app, so there is no process to stop');
-  live.engine.stop();
-  return { ok: true };
-});
-
-ipcMain.handle('dialog:pickDirectory', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory'] });
-  if (result.canceled || result.filePaths.length === 0) return null;
-  return result.filePaths[0];
+  const settingsPath = globalSettingsPath();
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, contents, 'utf8');
+  return { ok: true, path: settingsPath };
 });

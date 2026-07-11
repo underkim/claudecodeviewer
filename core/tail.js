@@ -7,8 +7,8 @@ import fs from 'node:fs';
  * whether *this* process spawned that Claude Code session. This is how
  * the viewer can watch a session someone started in their own terminal.
  *
- * Unlike core/engine.js, this is read-only: there's no stdin to write
- * follow-up turns into, since we're not the parent process.
+ * This is read-only: there's no stdin to write follow-up turns into,
+ * since we never own the underlying Claude Code process.
  *
  * @param {string} transcriptPath
  * @param {(message: object) => void} onMessage

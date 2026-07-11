@@ -1,4 +1,5 @@
 const DASHBOARD = '__dashboard__';
+const SETTINGS = '__settings__';
 
 const BADGE_COLORS = {
   system: '#58a6ff',
@@ -26,7 +27,7 @@ const SUPPRESSED_TYPES = new Set(['stream_event']);
 
 const state = {
   selectedSession: DASHBOARD,
-  sessions: new Map(), // sessionId -> session summary row (+ isLive, mode, activity)
+  sessions: new Map(), // sessionId -> session summary row (+ isLive, activity)
   streaming: new Map(), // sessionId -> { card, textEl, text }
 };
 
@@ -37,14 +38,17 @@ const el = {
   detailTitle: document.getElementById('detail-title'),
   backToDashboardBtn: document.getElementById('back-to-dashboard'),
   timeline: document.getElementById('timeline'),
-  newSessionForm: document.getElementById('new-session-form'),
-  newSessionError: document.getElementById('new-session-error'),
   composer: document.getElementById('composer'),
-  composerText: document.querySelector('#composer [name="text"]'),
-  composerSendBtn: document.querySelector('#composer button[type="submit"]'),
-  stopBtn: document.getElementById('stop-btn'),
+  detachBtn: document.getElementById('detach-btn'),
   discoverList: document.getElementById('discover-list'),
   discoverRefreshBtn: document.getElementById('discover-refresh-btn'),
+  settingsBtn: document.getElementById('settings-btn'),
+  settingsPanel: document.getElementById('settings-panel'),
+  settingsPath: document.getElementById('settings-path'),
+  settingsEditor: document.getElementById('settings-editor'),
+  settingsReloadBtn: document.getElementById('settings-reload-btn'),
+  settingsSaveBtn: document.getElementById('settings-save-btn'),
+  settingsStatus: document.getElementById('settings-status'),
 };
 
 function truncate(str, n) {
@@ -221,8 +225,7 @@ function buildProjectCard(s) {
 
   const footer = document.createElement('div');
   footer.className = 'project-footer';
-  const suffix = s.mode === 'attached' ? ' · attached' : '';
-  footer.textContent = `${formatRelative(s.lastEventAt || s.createdAt)} · ${s.eventCount ?? 0} events${suffix}`;
+  footer.textContent = `${formatRelative(s.lastEventAt || s.createdAt)} · ${s.eventCount ?? 0} events`;
   card.appendChild(footer);
 
   card.addEventListener('click', () => selectSession(s.sessionId));
@@ -249,8 +252,7 @@ function buildSessionItem(s) {
   if (!s.label) {
     const meta = document.createElement('div');
     meta.className = 'meta';
-    const suffix = s.mode === 'attached' ? ' · attached' : '';
-    meta.textContent = `${s.eventCount ?? 0} events · ${s.cwd || ''}${suffix}`;
+    meta.textContent = `${s.eventCount ?? 0} events · ${s.cwd || ''}`;
     div.appendChild(meta);
   }
 
@@ -258,18 +260,12 @@ function buildSessionItem(s) {
   return div;
 }
 
+// Every session this app tracks is attached (read-only), never spawned —
+// it never gives Claude Code any instructions, only watches. Composer
+// visibility is just "is this session still live to watch".
 function updateComposerVisibility() {
   const s = state.sessions.get(state.selectedSession);
-  const live = !!(s && s.isLive);
-  el.composer.hidden = !live;
-  if (!live) return;
-
-  // Attached sessions are read-only: we're tailing someone else's
-  // transcript file, not holding stdin, so there's nothing to send to.
-  const attached = s.mode === 'attached';
-  el.composerText.hidden = attached;
-  el.composerSendBtn.hidden = attached;
-  el.stopBtn.textContent = attached ? 'Detach' : 'Stop';
+  el.composer.hidden = !(s && s.isLive);
 }
 
 async function selectSession(sessionId) {
@@ -278,6 +274,7 @@ async function selectSession(sessionId) {
 
   if (sessionId === DASHBOARD) {
     el.dashboard.hidden = false;
+    el.settingsPanel.hidden = true;
     el.detailHeader.hidden = true;
     el.timeline.hidden = true;
     el.composer.hidden = true;
@@ -285,7 +282,18 @@ async function selectSession(sessionId) {
     return;
   }
 
+  if (sessionId === SETTINGS) {
+    el.dashboard.hidden = true;
+    el.settingsPanel.hidden = false;
+    el.detailHeader.hidden = true;
+    el.timeline.hidden = true;
+    el.composer.hidden = true;
+    await loadSettingsPanel();
+    return;
+  }
+
   el.dashboard.hidden = true;
+  el.settingsPanel.hidden = true;
   el.detailHeader.hidden = false;
   el.timeline.hidden = false;
   el.detailTitle.textContent = projectNameFromCwd(state.sessions.get(sessionId)?.cwd) || sessionId.slice(0, 12);
@@ -298,6 +306,14 @@ async function selectSession(sessionId) {
     appendEventCard(e);
   }
   el.timeline.scrollTop = el.timeline.scrollHeight;
+}
+
+async function loadSettingsPanel() {
+  el.settingsStatus.textContent = '';
+  el.settingsStatus.className = '';
+  const { path: settingsPath, contents } = await window.viewerAPI.readSettings();
+  el.settingsPath.textContent = settingsPath;
+  el.settingsEditor.value = contents;
 }
 
 function appendEventCard(envelope) {
@@ -406,8 +422,7 @@ function touchSession(envelope) {
       createdAt: envelope.receivedAt,
       lastEventAt: envelope.receivedAt,
       isLive: true,
-      mode: 'spawned',
-      activity: activity || { label: 'Starting…', busy: true },
+      activity: activity || { label: 'Watching…', busy: false },
     });
   }
   renderSessionList();
@@ -484,77 +499,35 @@ async function attachToDiscovered(item) {
     eventCount: 0,
     createdAt: new Date().toISOString(),
     isLive: true,
-    mode: 'attached',
     activity: { label: 'Watching…', busy: false },
   });
   await selectSession(data.sessionId);
   loadDiscoverList();
 }
 
-el.newSessionForm.addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  el.newSessionError.textContent = '';
-  const form = new FormData(el.newSessionForm);
-  const cwd = form.get('cwd').trim();
-  const prompt = form.get('prompt').trim();
-  const model = form.get('model').trim();
-  const permissionMode = form.get('permissionMode');
-
-  const body = { cwd, prompt };
-  if (model) body.model = model;
-  if (permissionMode) body.permissionMode = permissionMode;
-
-  const submitBtn = el.newSessionForm.querySelector('button[type="submit"]');
-  submitBtn.disabled = true;
-  submitBtn.textContent = 'Launching…';
-  try {
-    const data = await window.viewerAPI.createSession(body);
-
-    state.sessions.set(data.sessionId, {
-      sessionId: data.sessionId,
-      cwd,
-      eventCount: 0,
-      createdAt: new Date().toISOString(),
-      isLive: true,
-      mode: 'spawned',
-      activity: { label: 'Starting…', busy: true },
-    });
-    el.newSessionForm.querySelector('[name="prompt"]').value = '';
-    await selectSession(data.sessionId);
-  } catch (err) {
-    el.newSessionError.textContent = err.message;
-  } finally {
-    submitBtn.disabled = false;
-    submitBtn.textContent = 'Launch';
-  }
-});
-
-document.getElementById('browse-btn').addEventListener('click', async () => {
-  const dir = await window.viewerAPI.pickDirectory();
-  if (dir) el.newSessionForm.querySelector('[name="cwd"]').value = dir;
-});
-
-el.composer.addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const input = el.composer.querySelector('[name="text"]');
-  const text = input.value.trim();
-  if (!text || state.selectedSession === DASHBOARD) return;
-  input.value = '';
-  await window.viewerAPI.sendMessage(state.selectedSession, text);
-});
-
-el.stopBtn.addEventListener('click', async () => {
-  if (state.selectedSession === DASHBOARD) return;
-  const s = state.sessions.get(state.selectedSession);
-  if (s && s.mode === 'attached') {
-    await window.viewerAPI.detachSession(state.selectedSession);
-  } else {
-    await window.viewerAPI.stopSession(state.selectedSession);
-  }
+el.detachBtn.addEventListener('click', async () => {
+  if (state.selectedSession === DASHBOARD || state.selectedSession === SETTINGS) return;
+  await window.viewerAPI.detachSession(state.selectedSession);
 });
 
 el.discoverRefreshBtn.addEventListener('click', loadDiscoverList);
 el.backToDashboardBtn.addEventListener('click', () => selectSession(DASHBOARD));
+el.settingsBtn.addEventListener('click', () => selectSession(SETTINGS));
+
+el.settingsReloadBtn.addEventListener('click', loadSettingsPanel);
+
+el.settingsSaveBtn.addEventListener('click', async () => {
+  el.settingsStatus.textContent = 'Saving…';
+  el.settingsStatus.className = '';
+  try {
+    await window.viewerAPI.writeSettings(el.settingsEditor.value);
+    el.settingsStatus.textContent = 'Saved.';
+    el.settingsStatus.className = 'status-ok';
+  } catch (err) {
+    el.settingsStatus.textContent = err.message;
+    el.settingsStatus.className = 'status-error';
+  }
+});
 
 (async () => {
   await loadInitialSessions();
