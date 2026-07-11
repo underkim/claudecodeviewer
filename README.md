@@ -33,18 +33,21 @@ SQLite (core/db.js)
    each one to the renderer window the instant it arrives. It also reads
    and writes `~/.claude/settings.json` for the settings editor.
 3. **Renderer** (`viewer/`) — the window contents. The default view is a
-   **dashboard**: one card per session, showing its project name, whether
-   it's live, and a one-line status derived from its latest events
-   (`Running Bash`, `Thinking…`, `Idle — turn complete`, `Session ended`,
-   color-coded busy/idle/ended) — the "what's going on across everything"
-   view, updating live as events stream in. Click a card to drop into
-   that session's detail view: the full event timeline, tool calls, hook
-   activity, and turn text as color-coded cards, read-only (no composer
-   to send anything — just a Detach button), with a back button to
-   return to the dashboard. The renderer never touches the filesystem or
-   watches files itself — everything goes through `window.viewerAPI`
-   (`electron/preload.cjs`), an IPC bridge with no direct Node or OS
-   access.
+   **dashboard**: one card per *project* (sessions grouped by working
+   directory — a project can have several, past or live), showing
+   whether anything's live and a one-line status derived from the
+   busiest session's latest events (`Running Bash`, `Thinking…`, `Idle`,
+   `Ended`, color-coded), updating live as events stream in. Click a card
+   for the **project view**: stat tiles (sessions, tool calls, files
+   touched, turns) and a tool-usage breakdown, a **roadmap** reconstructed
+   from the project's `TaskCreate`/`TaskUpdate` tool calls (a progress bar
+   plus each task's status), and the list of sessions under it — click
+   one of those for the full event timeline (tool calls, hook activity,
+   turn text as color-coded cards), read-only, with a Detach button. Back
+   buttons return to the dashboard at each level. The renderer never
+   touches the filesystem or watches files itself — everything goes
+   through `window.viewerAPI` (`electron/preload.cjs`), an IPC bridge
+   with no direct Node or OS access.
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full transcript
 message reference, captured from a real session, not a schema invented
@@ -66,6 +69,28 @@ Claude Code session is never touched).
 
 SQLite history is stored under `data/events.db` in the project directory
 (gitignored); override with `CLAUDE_VIEWER_DB`.
+
+## Project stats & roadmap
+
+Clicking a dashboard card doesn't just replay the raw event log — it
+computes, across every session recorded under that working directory:
+
+- **Stats**: session count (and how many are live), total tool calls,
+  distinct files touched (from `file_path`/`path` on tool inputs), and
+  turn count, plus a breakdown of which tools were used how often.
+- **Roadmap**: Claude Code's own `TaskCreate`/`TaskUpdate` tool calls are
+  effectively a todo list already — `computeProjectStats()` in
+  `viewer/app.js` reconstructs it from the transcript (a task's numeric
+  id only appears in `TaskCreate`'s result text, e.g. `"Task #7 created
+  successfully: ..."`, so it's correlated back to the tool call via
+  `tool_use_id`) and shows it as a progress bar plus a status-sorted list
+  (`in_progress` → `pending` → `completed`). If a project's sessions
+  never used those tools, this section just says so — it's not invented.
+
+This is computed in the renderer from `viewerAPI.getEventsForProject(cwd)`
+(→ `sessions:eventsForCwd`, `core/db.js`), which pulls every event for
+every session sharing that `cwd` in one query; nothing beyond what's
+already in the transcripts is used.
 
 ## Global settings editor
 

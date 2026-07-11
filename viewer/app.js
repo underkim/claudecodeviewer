@@ -1,5 +1,6 @@
 const DASHBOARD = '__dashboard__';
 const SETTINGS = '__settings__';
+const PROJECT = '__project__';
 
 const BADGE_COLORS = {
   system: '#58a6ff',
@@ -27,9 +28,12 @@ const SUPPRESSED_TYPES = new Set(['stream_event']);
 
 const state = {
   selectedSession: DASHBOARD,
+  selectedProjectCwd: null,
   sessions: new Map(), // sessionId -> session summary row (+ isLive, activity)
   streaming: new Map(), // sessionId -> { card, textEl, text }
 };
+
+let projectRefreshTimer = null;
 
 const el = {
   sessions: document.getElementById('sessions'),
@@ -49,6 +53,14 @@ const el = {
   settingsReloadBtn: document.getElementById('settings-reload-btn'),
   settingsSaveBtn: document.getElementById('settings-save-btn'),
   settingsStatus: document.getElementById('settings-status'),
+  projectPanel: document.getElementById('project-panel'),
+  projectBackBtn: document.getElementById('project-back-btn'),
+  projectTitle: document.getElementById('project-title'),
+  projectCwdLabel: document.getElementById('project-cwd-label'),
+  projectStats: document.getElementById('project-stats'),
+  projectToolBreakdown: document.getElementById('project-tool-breakdown'),
+  projectRoadmap: document.getElementById('project-roadmap'),
+  projectSessions: document.getElementById('project-sessions'),
 };
 
 function truncate(str, n) {
@@ -166,6 +178,82 @@ function projectNameFromCwd(cwd) {
   return parts[parts.length - 1] || cwd;
 }
 
+function toolResultText(block) {
+  if (typeof block.content === 'string') return block.content;
+  if (Array.isArray(block.content)) return block.content.map((c) => c.text || '').join(' ');
+  return '';
+}
+
+// Claude Code's own TaskCreate/TaskUpdate tool calls are effectively a
+// project roadmap — reconstructing them from the transcript gives real
+// progress tracking instead of inventing a separate one. The task's
+// numeric id only appears in TaskCreate's *result* text ("Task #7
+// created successfully: ..."), not in the tool_use input, so results
+// have to be correlated back to their tool_use via tool_use_id.
+function applyTaskResult(tasks, toolUse, resultBlock) {
+  const text = toolResultText(resultBlock);
+  if (toolUse.name === 'TaskCreate') {
+    const m = text.match(/Task #(\S+) created successfully: (.+)/);
+    if (m) tasks.set(m[1], { id: m[1], subject: m[2], status: 'pending' });
+  } else if (toolUse.name === 'TaskUpdate') {
+    const taskId = toolUse.input?.taskId != null ? String(toolUse.input.taskId) : null;
+    if (!taskId) return;
+    const existing = tasks.get(taskId);
+    if (existing) {
+      if (toolUse.input.status) existing.status = toolUse.input.status;
+      if (toolUse.input.subject) existing.subject = toolUse.input.subject;
+    } else {
+      // The TaskCreate that made this id predates what we're looking at
+      // (an older session outside this project's recorded history) —
+      // still record the update so the task shows up.
+      tasks.set(taskId, {
+        id: taskId,
+        subject: toolUse.input.subject || `Task #${taskId}`,
+        status: toolUse.input.status || 'pending',
+      });
+    }
+  }
+}
+
+// Reduces a project's full event history down to tool-usage counts,
+// files touched, turn counts, and a task roadmap — the "stats" and
+// "roadmap" the dashboard's project view shows.
+function computeProjectStats(events) {
+  const toolCounts = new Map();
+  const filesTouched = new Set();
+  const pendingToolUses = new Map(); // tool_use id -> { name, input }
+  const tasks = new Map(); // task id -> { id, subject, status }
+  let userTurns = 0;
+  let assistantTurns = 0;
+
+  for (const e of events) {
+    const raw = e.raw || {};
+    if (e.type === 'assistant') {
+      assistantTurns++;
+      const blocks = raw.message?.content || [];
+      for (const b of blocks) {
+        if (b.type !== 'tool_use') continue;
+        toolCounts.set(b.name, (toolCounts.get(b.name) || 0) + 1);
+        const filePath = b.input?.file_path || b.input?.path;
+        if (filePath) filesTouched.add(filePath);
+        pendingToolUses.set(b.id, b);
+      }
+    } else if (e.type === 'user') {
+      userTurns++;
+      const blocks = raw.message?.content || [];
+      for (const b of blocks) {
+        if (b.type !== 'tool_result') continue;
+        const toolUse = pendingToolUses.get(b.tool_use_id);
+        if (toolUse && (toolUse.name === 'TaskCreate' || toolUse.name === 'TaskUpdate')) {
+          applyTaskResult(tasks, toolUse, b);
+        }
+      }
+    }
+  }
+
+  return { toolCounts, filesTouched, tasks, userTurns, assistantTurns };
+}
+
 function renderSessionList() {
   const sessions = [...state.sessions.values()].sort((a, b) =>
     (b.lastEventAt || b.createdAt || '').localeCompare(a.lastEventAt || a.createdAt || '')
@@ -176,60 +264,234 @@ function renderSessionList() {
   for (const s of sessions) el.sessions.appendChild(buildSessionItem(s));
 }
 
-function renderDashboard() {
-  const sessions = [...state.sessions.values()].sort((a, b) =>
-    (b.lastEventAt || b.createdAt || '').localeCompare(a.lastEventAt || a.createdAt || '')
-  );
+function groupSessionsByProject() {
+  const byCwd = new Map();
+  for (const s of state.sessions.values()) {
+    const key = s.cwd || '(unknown)';
+    if (!byCwd.has(key)) byCwd.set(key, []);
+    byCwd.get(key).push(s);
+  }
+  return byCwd;
+}
 
+function renderDashboard() {
+  const projects = groupSessionsByProject();
   el.dashboard.innerHTML = '';
 
-  if (sessions.length === 0) {
+  if (projects.size === 0) {
     const empty = document.createElement('div');
     empty.className = 'dashboard-empty';
-    empty.textContent = 'No sessions yet — launch one or attach to a running session from the sidebar.';
+    empty.textContent = 'No sessions yet — attach to a running session from the sidebar.';
     el.dashboard.appendChild(empty);
     return;
   }
 
-  for (const s of sessions) el.dashboard.appendChild(buildProjectCard(s));
+  const lastActive = (sessions) =>
+    sessions.reduce((max, s) => {
+      const t = s.lastEventAt || s.createdAt || '';
+      return t > max ? t : max;
+    }, '');
+
+  const entries = [...projects.entries()].sort((a, b) => lastActive(b[1]).localeCompare(lastActive(a[1])));
+  for (const [cwd, sessions] of entries) el.dashboard.appendChild(buildProjectSummaryCard(cwd, sessions));
 }
 
-function buildProjectCard(s) {
+function buildProjectSummaryCard(cwd, sessions) {
   const card = document.createElement('div');
   card.className = 'project-card';
 
   const head = document.createElement('div');
   head.className = 'project-card-head';
-  if (s.isLive) {
+  const liveCount = sessions.filter((s) => s.isLive).length;
+  if (liveCount > 0) {
     const dot = document.createElement('span');
     dot.className = 'live-dot';
     head.appendChild(dot);
   }
   const name = document.createElement('span');
   name.className = 'project-name';
-  name.textContent = projectNameFromCwd(s.cwd) || s.sessionId.slice(0, 8);
+  name.textContent = projectNameFromCwd(cwd) || cwd;
   head.appendChild(name);
   card.appendChild(head);
 
-  const cwd = document.createElement('div');
-  cwd.className = 'project-cwd';
-  cwd.title = s.cwd || '';
-  cwd.textContent = s.cwd || '';
-  card.appendChild(cwd);
+  const cwdEl = document.createElement('div');
+  cwdEl.className = 'project-cwd';
+  cwdEl.title = cwd;
+  cwdEl.textContent = cwd;
+  card.appendChild(cwdEl);
 
-  const activity = document.createElement('div');
-  const busy = s.isLive && s.activity?.busy;
-  activity.className = 'project-activity ' + (!s.isLive ? 'state-ended' : busy ? 'state-busy' : 'state-idle');
-  activity.textContent = s.activity?.label || (s.isLive ? 'Active' : 'Ended');
-  card.appendChild(activity);
+  const busySession = sessions.find((s) => s.isLive && s.activity?.busy);
+  const activityEl = document.createElement('div');
+  activityEl.className =
+    'project-activity ' + (busySession ? 'state-busy' : liveCount > 0 ? 'state-idle' : 'state-ended');
+  activityEl.textContent = busySession
+    ? busySession.activity.label
+    : liveCount > 0
+      ? `${liveCount} session${liveCount > 1 ? 's' : ''} active`
+      : 'Ended';
+  card.appendChild(activityEl);
+
+  const lastEventAt = sessions.reduce((max, s) => {
+    const t = s.lastEventAt || s.createdAt || '';
+    return t > max ? t : max;
+  }, '');
+  const totalEvents = sessions.reduce((sum, s) => sum + (s.eventCount || 0), 0);
 
   const footer = document.createElement('div');
   footer.className = 'project-footer';
-  footer.textContent = `${formatRelative(s.lastEventAt || s.createdAt)} · ${s.eventCount ?? 0} events`;
+  footer.textContent = `${formatRelative(lastEventAt)} · ${sessions.length} session${sessions.length > 1 ? 's' : ''} · ${totalEvents} events`;
   card.appendChild(footer);
 
-  card.addEventListener('click', () => selectSession(s.sessionId));
+  card.addEventListener('click', () => showProject(cwd));
   return card;
+}
+
+async function showProject(cwd) {
+  state.selectedSession = PROJECT;
+  state.selectedProjectCwd = cwd;
+  renderSessionList();
+
+  el.dashboard.hidden = true;
+  el.settingsPanel.hidden = true;
+  el.detailHeader.hidden = true;
+  el.timeline.hidden = true;
+  el.composer.hidden = true;
+  el.projectPanel.hidden = false;
+
+  await renderProjectPanel(cwd);
+}
+
+async function renderProjectPanel(cwd) {
+  const sessions = [...state.sessions.values()].filter((s) => (s.cwd || '(unknown)') === cwd);
+  el.projectTitle.textContent = projectNameFromCwd(cwd) || cwd;
+  el.projectCwdLabel.textContent = cwd;
+
+  const events = await window.viewerAPI.getEventsForProject(cwd);
+  const stats = computeProjectStats(events);
+
+  renderStatTiles(sessions, stats);
+  renderRoadmap(stats.tasks);
+  renderProjectSessionList(sessions);
+}
+
+function renderStatTiles(sessions, stats) {
+  el.projectStats.innerHTML = '';
+  const liveCount = sessions.filter((s) => s.isLive).length;
+  const totalToolCalls = [...stats.toolCounts.values()].reduce((a, b) => a + b, 0);
+
+  const tiles = [
+    { label: 'Sessions', value: liveCount > 0 ? `${sessions.length} (${liveCount} live)` : `${sessions.length}` },
+    { label: 'Tool calls', value: totalToolCalls },
+    { label: 'Files touched', value: stats.filesTouched.size },
+    { label: 'Turns', value: stats.userTurns + stats.assistantTurns },
+  ];
+  for (const t of tiles) {
+    const tile = document.createElement('div');
+    tile.className = 'stat-tile';
+    const value = document.createElement('div');
+    value.className = 'stat-value';
+    value.textContent = t.value;
+    const label = document.createElement('div');
+    label.className = 'stat-label';
+    label.textContent = t.label;
+    tile.appendChild(value);
+    tile.appendChild(label);
+    el.projectStats.appendChild(tile);
+  }
+
+  el.projectToolBreakdown.innerHTML = '';
+  const sortedTools = [...stats.toolCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+  for (const [name, count] of sortedTools) {
+    const chip = document.createElement('span');
+    chip.className = 'tool-chip';
+    chip.textContent = `${name} × ${count}`;
+    el.projectToolBreakdown.appendChild(chip);
+  }
+}
+
+function renderRoadmap(tasksMap) {
+  el.projectRoadmap.innerHTML = '';
+  const tasks = [...tasksMap.values()];
+
+  if (tasks.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'roadmap-empty';
+    empty.textContent = 'No task roadmap detected yet for this project.';
+    el.projectRoadmap.appendChild(empty);
+    return;
+  }
+
+  const completed = tasks.filter((t) => t.status === 'completed').length;
+  const pct = tasks.length ? Math.round((completed / tasks.length) * 100) : 0;
+
+  const bar = document.createElement('div');
+  bar.className = 'progress-bar';
+  const fill = document.createElement('div');
+  fill.className = 'progress-fill';
+  fill.style.width = `${pct}%`;
+  bar.appendChild(fill);
+  el.projectRoadmap.appendChild(bar);
+
+  const summary = document.createElement('div');
+  summary.className = 'roadmap-summary';
+  summary.textContent = `${completed} / ${tasks.length} tasks completed`;
+  el.projectRoadmap.appendChild(summary);
+
+  const order = { in_progress: 0, pending: 1, completed: 2 };
+  tasks.sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3) || Number(a.id) - Number(b.id));
+
+  const list = document.createElement('div');
+  list.className = 'roadmap-list';
+  for (const t of tasks) {
+    const item = document.createElement('div');
+    item.className = `roadmap-item status-${t.status}`;
+    const badge = document.createElement('span');
+    badge.className = 'roadmap-status';
+    badge.textContent = t.status;
+    const subject = document.createElement('span');
+    subject.className = 'roadmap-subject';
+    subject.textContent = t.subject;
+    item.appendChild(badge);
+    item.appendChild(subject);
+    list.appendChild(item);
+  }
+  el.projectRoadmap.appendChild(list);
+}
+
+function renderProjectSessionList(sessions) {
+  el.projectSessions.innerHTML = '';
+  const sorted = [...sessions].sort((a, b) =>
+    (b.lastEventAt || b.createdAt || '').localeCompare(a.lastEventAt || a.createdAt || '')
+  );
+  for (const s of sorted) {
+    const row = document.createElement('div');
+    row.className = 'project-session-row';
+    if (s.isLive) {
+      const dot = document.createElement('span');
+      dot.className = 'live-dot';
+      row.appendChild(dot);
+    }
+    const label = document.createElement('span');
+    label.className = 'project-session-label';
+    label.textContent = s.sessionId.slice(0, 12);
+    row.appendChild(label);
+    const activity = document.createElement('span');
+    activity.className = 'project-session-activity';
+    activity.textContent = s.activity?.label || (s.isLive ? 'Active' : 'Ended');
+    row.appendChild(activity);
+    row.addEventListener('click', () => selectSession(s.sessionId));
+    el.projectSessions.appendChild(row);
+  }
+}
+
+// Live events can arrive rapidly during a tool-heavy turn; debounce
+// re-fetching + recomputing a project's full stats so it doesn't refetch
+// on every single message.
+function scheduleProjectPanelRefresh(cwd) {
+  if (projectRefreshTimer) clearTimeout(projectRefreshTimer);
+  projectRefreshTimer = setTimeout(() => {
+    if (state.selectedSession === PROJECT && state.selectedProjectCwd === cwd) renderProjectPanel(cwd);
+  }, 400);
 }
 
 function buildSessionItem(s) {
@@ -274,6 +536,7 @@ async function selectSession(sessionId) {
 
   if (sessionId === DASHBOARD) {
     el.dashboard.hidden = false;
+    el.projectPanel.hidden = true;
     el.settingsPanel.hidden = true;
     el.detailHeader.hidden = true;
     el.timeline.hidden = true;
@@ -284,6 +547,7 @@ async function selectSession(sessionId) {
 
   if (sessionId === SETTINGS) {
     el.dashboard.hidden = true;
+    el.projectPanel.hidden = true;
     el.settingsPanel.hidden = false;
     el.detailHeader.hidden = true;
     el.timeline.hidden = true;
@@ -293,6 +557,7 @@ async function selectSession(sessionId) {
   }
 
   el.dashboard.hidden = true;
+  el.projectPanel.hidden = true;
   el.settingsPanel.hidden = true;
   el.detailHeader.hidden = false;
   el.timeline.hidden = false;
@@ -428,6 +693,9 @@ function touchSession(envelope) {
   renderSessionList();
   if (state.selectedSession === DASHBOARD) renderDashboard();
   if (state.selectedSession === envelope.sessionId) updateComposerVisibility();
+
+  const sessionCwd = state.sessions.get(envelope.sessionId)?.cwd;
+  if (sessionCwd) scheduleProjectPanelRefresh(sessionCwd);
 }
 
 function handleLiveEvent(envelope) {
@@ -506,12 +774,13 @@ async function attachToDiscovered(item) {
 }
 
 el.detachBtn.addEventListener('click', async () => {
-  if (state.selectedSession === DASHBOARD || state.selectedSession === SETTINGS) return;
+  if (state.selectedSession === DASHBOARD || state.selectedSession === SETTINGS || state.selectedSession === PROJECT) return;
   await window.viewerAPI.detachSession(state.selectedSession);
 });
 
 el.discoverRefreshBtn.addEventListener('click', loadDiscoverList);
 el.backToDashboardBtn.addEventListener('click', () => selectSession(DASHBOARD));
+el.projectBackBtn.addEventListener('click', () => selectSession(DASHBOARD));
 el.settingsBtn.addEventListener('click', () => selectSession(SETTINGS));
 
 el.settingsReloadBtn.addEventListener('click', loadSettingsPanel);

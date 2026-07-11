@@ -101,3 +101,15 @@ export function listEventsForSession(sessionId) {
     SELECT * FROM events WHERE session_id = ? ORDER BY received_at ASC
   `).all(sessionId).map(rowToEnvelope);
 }
+
+// Combines every event from every session recorded under the same
+// working directory, so the project view can compute stats/roadmap
+// across a project's whole history instead of one session at a time.
+export function listEventsForCwd(cwd) {
+  return db.prepare(`
+    SELECT e.* FROM events e
+    JOIN sessions s ON s.session_id = e.session_id
+    WHERE s.cwd = ?
+    ORDER BY e.received_at ASC
+  `).all(cwd).map(rowToEnvelope);
+}

@@ -95,6 +95,11 @@ renderer (`viewer/`, running in a `BrowserWindow`) only calls the API
   never touched).
 - `viewerAPI.listSessions()` / `viewerAPI.getSessionEvents(sessionId)` →
   `sessions:list` / `sessions:events` — history, backed by SQLite.
+- `viewerAPI.getEventsForProject(cwd)` → `sessions:eventsForCwd` — every
+  event from every session recorded under that `cwd`, in one query
+  (`core/db.js`'s `listEventsForCwd`); the renderer reduces this to the
+  project view's stats and task roadmap (`computeProjectStats()` in
+  `viewer/app.js`) rather than the main process precomputing them.
 - `viewerAPI.readSettings()` → `settings:read` — reads
   `~/.claude/settings.json`, returning `{ path, contents, exists }`
   (`contents` is `"{}\n"` and `exists: false` if the file doesn't exist

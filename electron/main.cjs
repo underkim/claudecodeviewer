@@ -102,6 +102,8 @@ ipcMain.handle('sessions:detach', (_event, { sessionId }) => {
 
 ipcMain.handle('sessions:events', (_event, sessionId) => db.listEventsForSession(sessionId));
 
+ipcMain.handle('sessions:eventsForCwd', (_event, cwd) => db.listEventsForCwd(cwd));
+
 function globalSettingsPath() {
   return path.join(os.homedir(), '.claude', 'settings.json');
 }

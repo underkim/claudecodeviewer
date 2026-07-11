@@ -29,6 +29,31 @@
     <div id="timeline-wrap">
       <div id="dashboard"></div>
 
+      <div id="project-panel" hidden>
+        <div class="project-panel-header">
+          <button type="button" id="project-back-btn">← Dashboard</button>
+          <div class="project-panel-title">
+            <span id="project-title"></span>
+            <span id="project-cwd-label"></span>
+          </div>
+        </div>
+        <div class="project-panel-body">
+          <section>
+            <div class="section-title">Stats</div>
+            <div id="project-stats" class="stat-grid"></div>
+            <div id="project-tool-breakdown" class="tool-breakdown"></div>
+          </section>
+          <section>
+            <div class="section-title">Roadmap</div>
+            <div id="project-roadmap"></div>
+          </section>
+          <section>
+            <div class="section-title">Sessions</div>
+            <div id="project-sessions"></div>
+          </section>
+        </div>
+      </div>
+
       <div id="settings-panel" hidden>
         <div class="settings-head">
           <span class="form-title">Global settings</span>
