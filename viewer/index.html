@@ -8,15 +8,18 @@
 <body>
   <div id="app">
     <header>
-      <span class="status-dot" id="status-dot"></span>
+      <span class="status-dot connected" id="status-dot"></span>
       <h1>Claude Code Viewer</h1>
-      <span id="status-text">connecting…</span>
+      <span id="status-text">ready</span>
     </header>
 
     <nav id="sidebar">
       <form id="new-session-form">
         <div class="form-title">New session</div>
-        <input name="cwd" placeholder="Working directory (cwd)" required />
+        <div class="form-row">
+          <input name="cwd" placeholder="Working directory (cwd)" required />
+          <button type="button" id="browse-btn">Browse…</button>
+        </div>
         <textarea name="prompt" placeholder="Initial prompt" rows="3" required></textarea>
         <div class="form-row">
           <input name="model" placeholder="model (optional)" />

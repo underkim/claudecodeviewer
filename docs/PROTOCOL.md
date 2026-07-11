@@ -13,7 +13,7 @@ Agent SDK is built on — and this viewer now speaks it directly.
 
 ## Transport: the `claude` CLI itself
 
-The server spawns `claude` as a child process:
+The Electron main process spawns `claude` as a child process:
 
 ```
 claude --print \
@@ -36,9 +36,9 @@ claude --print \
   hook lifecycle, rate limits, turn results — comes through here, verbatim,
   as it happens.
 
-This is a single persistent pipe per session: the server *is* the parent
-process, so it knows the session's progress by construction, not by
-inference from a side channel.
+This is a single persistent pipe per session: the main process *is* the
+parent process, so it knows the session's progress by construction, not
+by inference from a side channel.
 
 ## Message types observed on stdout
 
@@ -59,18 +59,18 @@ made up):
 | `rate_limit_event`  | —                                        | Rate-limit status snapshot |
 | `active_goal`       | —                                        | The active `/goal` condition, if any |
 
-Every message carries `session_id`, so the server never has to wait for a
-specific message to learn which session an event belongs to — the very
-first line already has it.
+Every message carries `session_id`, so the main process never has to
+wait for a specific message to learn which session an event belongs to —
+the very first line already has it.
 
-## Server-side envelope
+## Envelope stored in SQLite / sent to the renderer
 
-The server wraps each raw message before storing/broadcasting it:
+The main process wraps each raw message before storing/forwarding it:
 
 ```jsonc
 {
   "protocolVersion": "2",
-  "eventId": "uuid",           // server-assigned
+  "eventId": "uuid",           // main-process-assigned
   "sessionId": "...",          // Claude Code's own session_id
   "receivedAt": "2026-07-11T05:20:00.000Z",
   "type": "assistant",         // raw.type, passed through
@@ -80,36 +80,46 @@ The server wraps each raw message before storing/broadcasting it:
 ```
 
 `raw` is never reshaped — new fields Claude Code adds show up immediately
-without a server change.
+without a code change.
 
-One synthetic type is added by the server itself, clearly namespaced so
-it's never confused with Claude Code's own protocol: `engine`
-(`subtype`: `exit`, `stderr`, `unparsed_stdout`) — bookkeeping about the
-child process (it exited, it wrote to stderr, a line failed to parse).
+One synthetic type is added by the main process itself, clearly
+namespaced so it's never confused with Claude Code's own protocol:
+`engine` (`subtype`: `exit`, `stderr`, `unparsed_stdout`) — bookkeeping
+about the child process (it exited, it wrote to stderr, a line failed to
+parse).
 
-## HTTP / WebSocket surface (server ↔ browser)
+## IPC surface (Electron main process ↔ renderer)
 
-This layer is unchanged in spirit from v1 — it's just how the *browser*
-talks to *our* server, not how the server talks to Claude Code:
+This app is a desktop app, not a client/server pair over a network port.
+The main process (`electron/main.cjs`) owns the `claude` child processes
+directly; the renderer (`viewer/`, running in a `BrowserWindow`) never
+touches the network or the filesystem itself — it only calls the API
+`electron/preload.cjs` exposes on `window.viewerAPI`, which forwards to
+`ipcMain.handle` channels in the main process:
 
-- `POST /api/sessions` `{ cwd, prompt, model?, permissionMode? }` — spawns
-  a new `claude` child process in `cwd`, sends `prompt` as the first turn,
-  responds `{ sessionId }` once Claude Code reports its own session id.
-- `POST /api/sessions/:sessionId/message` `{ text }` — writes another turn
-  to a live session's stdin.
-- `POST /api/sessions/:sessionId/stop` — sends `SIGTERM` to the child.
-- `GET /api/sessions` / `GET /api/sessions/:sessionId/events` — history,
-  backed by SQLite.
-- `WS /ws` — pushes `{ "type": "event", "data": <envelope> }` for every
-  new message as it's ingested.
+- `viewerAPI.createSession({ cwd, prompt, model?, permissionMode? })` →
+  `sessions:create` — spawns a new `claude` child process in `cwd`, sends
+  `prompt` as the first turn, resolves `{ sessionId }` once Claude Code
+  reports its own session id.
+- `viewerAPI.sendMessage(sessionId, text)` → `sessions:message` — writes
+  another turn to a live session's stdin.
+- `viewerAPI.stopSession(sessionId)` → `sessions:stop` — sends `SIGTERM`
+  to the child.
+- `viewerAPI.listSessions()` / `viewerAPI.getSessionEvents(sessionId)` →
+  `sessions:list` / `sessions:events` — history, backed by SQLite.
+- `viewerAPI.pickDirectory()` → `dialog:pickDirectory` — native OS folder
+  picker for choosing a project directory.
+- `viewerAPI.onEvent(callback)` — subscribes to `viewer:event`, which the
+  main process pushes (`mainWindow.webContents.send`) for every new
+  message as it's ingested, no polling involved.
 
 ## A note on environment isolation
 
 `claude` reads several `CLAUDE_CODE_*` environment variables to attach to
 an existing session (useful when Claude Code re-execs itself, harmful
-here). The server explicitly strips `CLAUDE_CODE_SESSION_ID`,
+here). The main process explicitly strips `CLAUDE_CODE_SESSION_ID`,
 `CLAUDE_CODE_REMOTE_SESSION_ID`, and `CLAUDE_CODE_CHILD_SESSION` from the
-child's environment before spawning (`server/engine.js`) — otherwise, if
-the viewer server happens to be running inside a Claude Code session
-itself, every session it launches would silently attach to *that* one
+child's environment before spawning (`core/engine.js`) — otherwise, if
+the viewer app itself happens to be launched from inside a Claude Code
+session, every session it launches would silently attach to *that* one
 instead of starting its own.

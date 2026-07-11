@@ -1,34 +1,42 @@
 # claudecodeviewer
 
-A real-time viewer for what Claude Code is doing. The server launches
-Claude Code itself as a child process and speaks its native `stream-json`
-protocol — the same structured, bidirectional interface the Claude Agent
-SDK is built on — so it knows every token, tool call, and lifecycle event
-directly, as it happens, with nothing invented in between.
+A desktop app for watching Claude Code work in real time on your local
+projects. It launches Claude Code itself as a child process and speaks
+its native `stream-json` protocol — the same structured, bidirectional
+interface the Claude Agent SDK is built on — so it knows every token,
+tool call, and lifecycle event directly, as it happens, with nothing
+invented in between.
 
 ## How it works
 
 ```
-browser  <--(WebSocket push)-->  server  <--(stdin/stdout, stream-json)-->  claude (child process)
-                                    |
-                              SQLite storage
+renderer (viewer/, in a BrowserWindow)
+   |  window.viewerAPI.*  (IPC, via electron/preload.cjs)
+   v
+electron/main.cjs  <--(stdin/stdout, stream-json)-->  claude (child process)
+   |
+SQLite (core/db.js)
 ```
 
-1. **Engine** (`server/engine.js`) — spawns
+1. **Engine** (`core/engine.js`) — spawns
    `claude --print --input-format stream-json --output-format stream-json
    --verbose --include-partial-messages` for a given working directory.
    Every conversational turn goes in over stdin as one JSON line; every
    message Claude Code emits about its own execution — token deltas, tool
    calls, hook firings, turn results — comes out over stdout as one JSON
    line. The pipe stays open, so a session can take follow-up prompts.
-2. **Server** (`server/index.js`) — owns the child process, persists every
-   message verbatim to SQLite (`server/db.js`), and pushes each one to
-   connected browsers over a WebSocket the instant it arrives.
-3. **Viewer** (`viewer/`) — a static page (no build step): launch a new
-   session (working directory + prompt) or pick a running one, and watch
-   its assistant text stream in token-by-token, tool calls, hook activity,
+2. **Main process** (`electron/main.cjs`) — owns the child processes,
+   persists every message verbatim to SQLite (`core/db.js`), and pushes
+   each one to the renderer window the instant it arrives. It also
+   exposes a native OS folder picker for choosing a project directory.
+3. **Renderer** (`viewer/`) — the window contents: launch a new session
+   (working directory + prompt) or pick a running one, and watch its
+   assistant text stream in token-by-token, tool calls, hook activity,
    and turn results as color-coded cards. A composer lets you send
-   follow-up messages to a live session, or stop it.
+   follow-up messages to a live session, or stop it. It never touches the
+   filesystem or spawns processes itself — everything goes through
+   `window.viewerAPI` (`electron/preload.cjs`), an IPC bridge with no
+   direct Node or OS access.
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full message reference
 — it documents Claude Code's actual protocol, captured from a real run,
@@ -38,29 +46,36 @@ not a schema invented on top of it.
 
 ```bash
 npm install
-npm start          # starts the viewer server on http://localhost:4317
+npm start
 ```
 
-Open http://localhost:4317, fill in a working directory and a prompt in
-the "New session" panel, and hit Launch. The session's output streams in
-live; use the composer at the bottom to send follow-up turns, or Stop to
-end it.
+This opens the app window. Fill in a working directory (or use Browse…)
+and a prompt in the "New session" panel, and hit Launch. The session's
+output streams in live; use the composer at the bottom to send follow-up
+turns, or Stop to end it.
 
-Configuration (env vars):
-- `CLAUDE_VIEWER_PORT` — server port (default `4317`).
-- `CLAUDE_VIEWER_DB` — SQLite file path (default `data/events.db`,
-  gitignored).
-- `CLAUDE_VIEWER_CLAUDE_BIN` — path to the `claude` executable, if it's
-  not on `PATH` (default `claude`).
+Requires the `claude` CLI to be installed and on `PATH` (or set
+`CLAUDE_VIEWER_CLAUDE_BIN` to its full path). SQLite history is stored
+under `data/events.db` in the project directory (gitignored); override
+with `CLAUDE_VIEWER_DB`.
 
-## Why not hooks?
+## Why a desktop app, and why not hooks?
 
-An earlier version of this project used Claude Code's hooks system: a
-script run as a subprocess per lifecycle event, POSTing JSON to this
-server over HTTP. It worked, but every "event" required spawning a new
-process and a one-way HTTP call, and it couldn't see anything between
-hook boundaries (streamed text, partial tool input). Speaking Claude
-Code's own `stream-json` protocol directly — with the server as the
-actual parent process — is a real contract instead of a workaround: one
-persistent pipe, bidirectional, and it surfaces everything Claude Code
-itself knows about its own progress.
+Two design decisions worth knowing about, since both changed from
+earlier iterations of this project:
+
+- **Desktop app, not a browser + server**: a browser tab can't spawn OS
+  processes or hold open a pipe to a CLI tool — only a real process with
+  Node/OS access can. Electron's main process *is* that process, so it
+  can own `claude` directly and talk to it over IPC with the window,
+  instead of running an HTTP/WebSocket server on a port just to bridge
+  browser sandboxing.
+- **Native `stream-json` protocol, not hooks**: an earlier version used
+  Claude Code's hooks system — a script run as a subprocess per lifecycle
+  event, POSTing JSON to a server. It worked, but every "event" required
+  spawning a new process and a one-way HTTP call, and it couldn't see
+  anything between hook boundaries (streamed text, partial tool input).
+  Speaking Claude Code's own `stream-json` protocol directly — with the
+  app as the actual parent process — is a real contract instead of a
+  workaround: one persistent pipe, bidirectional, surfacing everything
+  Claude Code itself knows about its own progress.

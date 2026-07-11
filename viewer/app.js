@@ -24,8 +24,6 @@ const state = {
 const el = {
   sessions: document.getElementById('sessions'),
   timeline: document.getElementById('timeline'),
-  statusDot: document.getElementById('status-dot'),
-  statusText: document.getElementById('status-text'),
   newSessionForm: document.getElementById('new-session-form'),
   newSessionError: document.getElementById('new-session-error'),
   composer: document.getElementById('composer'),
@@ -149,8 +147,7 @@ async function selectSession(sessionId) {
     return;
   }
 
-  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/events`);
-  const events = await res.json();
+  const events = await window.viewerAPI.getSessionEvents(sessionId);
   for (const e of events) {
     if (SUPPRESSED_TYPES.has(e.type)) continue;
     appendEventCard(e);
@@ -280,30 +277,9 @@ function handleLiveEvent(envelope) {
 }
 
 async function loadInitialSessions() {
-  const res = await fetch('/api/sessions');
-  const sessions = await res.json();
+  const sessions = await window.viewerAPI.listSessions();
   for (const s of sessions) state.sessions.set(s.sessionId, s);
   renderSessionList();
-}
-
-function connectWebSocket() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
-
-  ws.addEventListener('open', () => {
-    el.statusDot.className = 'status-dot connected';
-    el.statusText.textContent = 'connected';
-  });
-  ws.addEventListener('close', () => {
-    el.statusDot.className = 'status-dot disconnected';
-    el.statusText.textContent = 'disconnected — retrying…';
-    setTimeout(connectWebSocket, 2000);
-  });
-  ws.addEventListener('error', () => ws.close());
-  ws.addEventListener('message', (msg) => {
-    const parsed = JSON.parse(msg.data);
-    if (parsed.type === 'event') handleLiveEvent(parsed.data);
-  });
 }
 
 el.newSessionForm.addEventListener('submit', async (ev) => {
@@ -323,13 +299,7 @@ el.newSessionForm.addEventListener('submit', async (ev) => {
   submitBtn.disabled = true;
   submitBtn.textContent = 'Launching…';
   try {
-    const res = await fetch('/api/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    const data = await window.viewerAPI.createSession(body);
 
     state.sessions.set(data.sessionId, {
       sessionId: data.sessionId,
@@ -348,24 +318,25 @@ el.newSessionForm.addEventListener('submit', async (ev) => {
   }
 });
 
+document.getElementById('browse-btn').addEventListener('click', async () => {
+  const dir = await window.viewerAPI.pickDirectory();
+  if (dir) el.newSessionForm.querySelector('[name="cwd"]').value = dir;
+});
+
 el.composer.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const input = el.composer.querySelector('[name="text"]');
   const text = input.value.trim();
   if (!text || state.selectedSession === ALL_SESSIONS) return;
   input.value = '';
-  await fetch(`/api/sessions/${encodeURIComponent(state.selectedSession)}/message`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
-  });
+  await window.viewerAPI.sendMessage(state.selectedSession, text);
 });
 
 el.stopBtn.addEventListener('click', async () => {
   if (state.selectedSession === ALL_SESSIONS) return;
-  await fetch(`/api/sessions/${encodeURIComponent(state.selectedSession)}/stop`, { method: 'POST' });
+  await window.viewerAPI.stopSession(state.selectedSession);
 });
 
 loadInitialSessions();
 renderSessionList();
-connectWebSocket();
+window.viewerAPI.onEvent(handleLiveEvent);
