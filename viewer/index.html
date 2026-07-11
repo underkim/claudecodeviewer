@@ -12,10 +12,38 @@
       <h1>Claude Code Viewer</h1>
       <span id="status-text">connecting…</span>
     </header>
-    <nav id="sessions"></nav>
-    <main id="timeline">
-      <div id="empty-state">Select a session, or watch "All sessions" for live events as they arrive.</div>
-    </main>
+
+    <nav id="sidebar">
+      <form id="new-session-form">
+        <div class="form-title">New session</div>
+        <input name="cwd" placeholder="Working directory (cwd)" required />
+        <textarea name="prompt" placeholder="Initial prompt" rows="3" required></textarea>
+        <div class="form-row">
+          <input name="model" placeholder="model (optional)" />
+          <select name="permissionMode">
+            <option value="">permission: default</option>
+            <option value="plan">plan</option>
+            <option value="acceptEdits">acceptEdits</option>
+            <option value="dontAsk">dontAsk</option>
+            <option value="bypassPermissions">bypassPermissions</option>
+          </select>
+        </div>
+        <button type="submit">Launch</button>
+        <div id="new-session-error" class="form-error"></div>
+      </form>
+      <div id="sessions"></div>
+    </nav>
+
+    <div id="timeline-wrap">
+      <main id="timeline">
+        <div id="empty-state">Launch a session, or pick one from the list to watch its live protocol stream.</div>
+      </main>
+      <form id="composer" hidden>
+        <input name="text" placeholder="Send a follow-up message to this session…" autocomplete="off" />
+        <button type="submit">Send</button>
+        <button type="button" id="stop-btn">Stop</button>
+      </form>
+    </div>
   </div>
   <script src="app.js"></script>
 </body>

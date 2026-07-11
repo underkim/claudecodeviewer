@@ -1,77 +1,106 @@
 import Database from 'better-sqlite3';
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = process.env.CLAUDE_VIEWER_DB || path.join(__dirname, '..', 'data', 'events.db');
-
-import fs from 'node:fs';
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    cwd TEXT,
+    model TEXT,
+    permission_mode TEXT,
+    created_at TEXT NOT NULL,
+    ended_at TEXT
+  );
+
   CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
-    hook_event TEXT NOT NULL,
+    msg_type TEXT NOT NULL,
+    msg_subtype TEXT,
     received_at TEXT NOT NULL,
-    cwd TEXT,
-    transcript_path TEXT,
     payload TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_events_session ON events (session_id, received_at);
 `);
 
-const insertStmt = db.prepare(`
-  INSERT INTO events (event_id, session_id, hook_event, received_at, cwd, transcript_path, payload)
-  VALUES (@eventId, @sessionId, @hookEvent, @receivedAt, @cwd, @transcriptPath, @payload)
+const upsertSessionStmt = db.prepare(`
+  INSERT INTO sessions (session_id, cwd, model, permission_mode, created_at)
+  VALUES (@sessionId, @cwd, @model, @permissionMode, @createdAt)
+  ON CONFLICT(session_id) DO NOTHING
 `);
 
+const endSessionStmt = db.prepare(`
+  UPDATE sessions SET ended_at = @endedAt WHERE session_id = @sessionId
+`);
+
+const insertEventStmt = db.prepare(`
+  INSERT INTO events (event_id, session_id, msg_type, msg_subtype, received_at, payload)
+  VALUES (@eventId, @sessionId, @msgType, @msgSubtype, @receivedAt, @payload)
+`);
+
+export function createSession({ sessionId, cwd, model, permissionMode }) {
+  upsertSessionStmt.run({
+    sessionId,
+    cwd: cwd ?? null,
+    model: model ?? null,
+    permissionMode: permissionMode ?? null,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+export function endSession(sessionId) {
+  endSessionStmt.run({ sessionId, endedAt: new Date().toISOString() });
+}
+
 export function insertEvent(envelope) {
-  insertStmt.run({
+  insertEventStmt.run({
     eventId: envelope.eventId,
     sessionId: envelope.sessionId,
-    hookEvent: envelope.hookEvent,
+    msgType: envelope.type,
+    msgSubtype: envelope.subtype ?? null,
     receivedAt: envelope.receivedAt,
-    cwd: envelope.cwd ?? null,
-    transcriptPath: envelope.transcriptPath ?? null,
-    payload: JSON.stringify(envelope.payload ?? {}),
+    payload: JSON.stringify(envelope.raw ?? {}),
   });
 }
 
 function rowToEnvelope(row) {
   return {
-    protocolVersion: '1',
+    protocolVersion: '2',
     eventId: row.event_id,
     sessionId: row.session_id,
-    hookEvent: row.hook_event,
     receivedAt: row.received_at,
-    cwd: row.cwd,
-    transcriptPath: row.transcript_path,
-    payload: JSON.parse(row.payload),
+    type: row.msg_type,
+    subtype: row.msg_subtype,
+    raw: JSON.parse(row.payload),
   };
 }
 
 export function listSessions() {
-  const rows = db.prepare(`
+  return db.prepare(`
     SELECT
-      session_id AS sessionId,
-      COUNT(*) AS eventCount,
-      MIN(received_at) AS startedAt,
-      MAX(received_at) AS lastEventAt,
-      (SELECT cwd FROM events e2 WHERE e2.session_id = e1.session_id AND cwd IS NOT NULL LIMIT 1) AS cwd
-    FROM events e1
-    GROUP BY session_id
-    ORDER BY lastEventAt DESC
+      s.session_id AS sessionId,
+      s.cwd,
+      s.model,
+      s.permission_mode AS permissionMode,
+      s.created_at AS createdAt,
+      s.ended_at AS endedAt,
+      (SELECT COUNT(*) FROM events e WHERE e.session_id = s.session_id) AS eventCount,
+      (SELECT MAX(received_at) FROM events e WHERE e.session_id = s.session_id) AS lastEventAt
+    FROM sessions s
+    ORDER BY s.created_at DESC
   `).all();
-  return rows;
 }
 
 export function listEventsForSession(sessionId) {
-  const rows = db.prepare(`
+  return db.prepare(`
     SELECT * FROM events WHERE session_id = ? ORDER BY received_at ASC
-  `).all(sessionId);
-  return rows.map(rowToEnvelope);
+  `).all(sessionId).map(rowToEnvelope);
 }

@@ -1,19 +1,24 @@
 const ALL_SESSIONS = '__all__';
 
 const BADGE_COLORS = {
-  SessionStart: '#58a6ff',
-  UserPromptSubmit: '#bc8cff',
-  PreToolUse: '#d29922',
-  PostToolUse: '#3fb950',
-  Notification: '#39c5cf',
-  Stop: '#8b949e',
-  SubagentStop: '#8b949e',
-  PreCompact: '#f85149',
+  system: '#58a6ff',
+  assistant: '#3fb950',
+  user: '#bc8cff',
+  result: '#d29922',
+  rate_limit_event: '#8b949e',
+  active_goal: '#8b949e',
+  engine: '#f85149',
 };
+
+// Raw protocol message types that only exist to drive the live "typing"
+// effect — they're folded into the assistant card they belong to and never
+// get their own row, in history or live.
+const SUPPRESSED_TYPES = new Set(['stream_event']);
 
 const state = {
   selectedSession: ALL_SESSIONS,
-  sessions: new Map(), // sessionId -> {sessionId, eventCount, startedAt, lastEventAt, cwd}
+  sessions: new Map(), // sessionId -> session summary row (+ isLive)
+  streaming: new Map(), // sessionId -> { card, textEl, text }
 };
 
 const el = {
@@ -21,64 +26,103 @@ const el = {
   timeline: document.getElementById('timeline'),
   statusDot: document.getElementById('status-dot'),
   statusText: document.getElementById('status-text'),
+  newSessionForm: document.getElementById('new-session-form'),
+  newSessionError: document.getElementById('new-session-error'),
+  composer: document.getElementById('composer'),
+  stopBtn: document.getElementById('stop-btn'),
 };
 
-function summarize(envelope) {
-  const p = envelope.payload || {};
-  switch (envelope.hookEvent) {
-    case 'PreToolUse':
-    case 'PostToolUse': {
-      const input = p.tool_input || {};
-      const detail = input.command || input.file_path || input.path || input.pattern || '';
-      return `${p.tool_name || 'tool'}${detail ? ' — ' + truncate(String(detail), 80) : ''}`;
-    }
-    case 'UserPromptSubmit':
-      return truncate(String(p.prompt || ''), 100);
-    case 'Notification':
-      return truncate(String(p.message || ''), 100);
-    case 'SessionStart':
-      return `source: ${p.source || 'unknown'}`;
-    case 'PreCompact':
-      return `trigger: ${p.trigger || 'unknown'}`;
-    default:
-      return '';
-  }
-}
-
 function truncate(str, n) {
+  str = String(str);
   return str.length > n ? str.slice(0, n) + '…' : str;
 }
 
 function formatTime(iso) {
-  const d = new Date(iso);
-  return d.toLocaleTimeString([], { hour12: false });
+  return new Date(iso).toLocaleTimeString([], { hour12: false });
+}
+
+function textFromContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((block) => {
+      if (block.type === 'text') return block.text;
+      if (block.type === 'tool_use') return `[tool_use ${block.name}] ${JSON.stringify(block.input)}`;
+      if (block.type === 'tool_result') {
+        const c = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+        return `[tool_result${block.is_error ? ' ERROR' : ''}] ${c}`;
+      }
+      return `[${block.type}]`;
+    })
+    .join(' ');
+}
+
+function summarize(envelope) {
+  const raw = envelope.raw || {};
+  switch (envelope.type) {
+    case 'system':
+      switch (envelope.subtype) {
+        case 'init': return `session started — model ${raw.model}, cwd ${raw.cwd}`;
+        case 'status': return `status: ${raw.status}`;
+        case 'hook_started': return `hook running: ${raw.hook_name}`;
+        case 'hook_response': return `hook done: ${raw.hook_name} (exit ${raw.exit_code})`;
+        case 'post_turn_summary': return raw.status_detail || '';
+        default: return envelope.subtype || '';
+      }
+    case 'assistant':
+      return truncate(textFromContent(raw.message?.content), 160);
+    case 'user':
+      return truncate(textFromContent(raw.message?.content), 160);
+    case 'result':
+      return `${raw.subtype} — "${truncate(raw.result || '', 80)}" (${raw.duration_ms}ms, $${(raw.total_cost_usd || 0).toFixed(4)})`;
+    case 'rate_limit_event':
+      return `rate limit: ${raw.rate_limit_info?.status || ''}`;
+    case 'active_goal':
+      return raw.value ? truncate(raw.value, 120) : '(cleared)';
+    case 'engine':
+      if (envelope.subtype === 'exit') return `process exited (code ${raw.code}, signal ${raw.signal})`;
+      if (envelope.subtype === 'stderr') return truncate(raw.text, 160);
+      return truncate(raw.text || '', 160);
+    default:
+      return truncate(JSON.stringify(raw), 160);
+  }
+}
+
+function badgeLabel(envelope) {
+  return envelope.subtype ? `${envelope.type}:${envelope.subtype}` : envelope.type;
 }
 
 function renderSessionList() {
-  const sessions = [...state.sessions.values()].sort((a, b) => (b.lastEventAt || '').localeCompare(a.lastEventAt || ''));
+  const sessions = [...state.sessions.values()].sort((a, b) =>
+    (b.lastEventAt || b.createdAt || '').localeCompare(a.lastEventAt || a.createdAt || '')
+  );
 
   el.sessions.innerHTML = '';
   el.sessions.appendChild(buildSessionItem({ sessionId: ALL_SESSIONS, label: 'All sessions (live)' }));
-
-  for (const s of sessions) {
-    el.sessions.appendChild(buildSessionItem(s));
-  }
+  for (const s of sessions) el.sessions.appendChild(buildSessionItem(s));
 }
 
 function buildSessionItem(s) {
   const div = document.createElement('div');
   div.className = 'session-item' + (state.selectedSession === s.sessionId ? ' active' : '');
-  div.dataset.sessionId = s.sessionId;
 
-  const sid = document.createElement('div');
+  const row = document.createElement('div');
+  row.className = 'sid-row';
+  if (s.isLive) {
+    const dot = document.createElement('span');
+    dot.className = 'live-dot';
+    row.appendChild(dot);
+  }
+  const sid = document.createElement('span');
   sid.className = 'sid';
   sid.textContent = s.label || s.sessionId.slice(0, 12);
-  div.appendChild(sid);
+  row.appendChild(sid);
+  div.appendChild(row);
 
   if (!s.label) {
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = `${s.eventCount} events · ${s.cwd || ''}`;
+    meta.textContent = `${s.eventCount ?? 0} events · ${s.cwd || ''}`;
     div.appendChild(meta);
   }
 
@@ -86,10 +130,16 @@ function buildSessionItem(s) {
   return div;
 }
 
+function updateComposerVisibility() {
+  const s = state.sessions.get(state.selectedSession);
+  el.composer.hidden = !(s && s.isLive);
+}
+
 async function selectSession(sessionId) {
   state.selectedSession = sessionId;
   renderSessionList();
   el.timeline.innerHTML = '';
+  updateComposerVisibility();
 
   if (sessionId === ALL_SESSIONS) {
     const empty = document.createElement('div');
@@ -101,27 +151,27 @@ async function selectSession(sessionId) {
 
   const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/events`);
   const events = await res.json();
-  for (const e of events) appendEventCard(e);
+  for (const e of events) {
+    if (SUPPRESSED_TYPES.has(e.type)) continue;
+    appendEventCard(e);
+  }
   el.timeline.scrollTop = el.timeline.scrollHeight;
 }
 
 function appendEventCard(envelope) {
   const emptyState = document.getElementById('empty-state');
   if (emptyState && state.selectedSession !== ALL_SESSIONS) emptyState.remove();
-  if (emptyState && state.selectedSession === ALL_SESSIONS) {
-    // keep the "watching" note but still add cards below it
-  }
 
   const card = document.createElement('div');
-  card.className = 'event-card';
+  card.className = 'event-card' + (envelope.type === 'engine' ? ' engine-card' : '');
 
   const head = document.createElement('div');
   head.className = 'event-head';
 
   const badge = document.createElement('span');
   badge.className = 'badge';
-  badge.style.background = BADGE_COLORS[envelope.hookEvent] || '#8b949e';
-  badge.textContent = envelope.hookEvent;
+  badge.style.background = BADGE_COLORS[envelope.type] || '#8b949e';
+  badge.textContent = badgeLabel(envelope);
   head.appendChild(badge);
 
   const summary = document.createElement('span');
@@ -139,40 +189,94 @@ function appendEventCard(envelope) {
 
   const payload = document.createElement('div');
   payload.className = 'event-payload';
-  payload.textContent = JSON.stringify(
-    { sessionId: envelope.sessionId, cwd: envelope.cwd, ...envelope.payload },
-    null,
-    2
-  );
+  payload.textContent = JSON.stringify(envelope.raw, null, 2);
   card.appendChild(payload);
 
   el.timeline.appendChild(card);
   el.timeline.scrollTop = el.timeline.scrollHeight;
+  return { card, summary };
+}
+
+function isViewingSession(sessionId) {
+  return state.selectedSession === ALL_SESSIONS || state.selectedSession === sessionId;
+}
+
+// Folds token-by-token stream_event deltas into one live-updating card per
+// in-flight assistant turn, so the browser shows text arriving the way it
+// would in a terminal, instead of one DOM node per token.
+function handleStreamEvent(envelope) {
+  const sessionId = envelope.sessionId;
+  const event = envelope.raw.event || {};
+
+  if (event.type === 'message_start') {
+    if (!isViewingSession(sessionId)) return;
+    const placeholder = {
+      protocolVersion: envelope.protocolVersion,
+      eventId: envelope.eventId,
+      sessionId,
+      receivedAt: envelope.receivedAt,
+      type: 'assistant',
+      subtype: null,
+      raw: { message: { content: [{ type: 'text', text: '' }] } },
+    };
+    const { card, summary } = appendEventCard(placeholder);
+    card.classList.add('streaming-card');
+    state.streaming.set(sessionId, { card, summary, text: '' });
+  } else if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+    const s = state.streaming.get(sessionId);
+    if (!s) return;
+    s.text += event.delta.text;
+    s.summary.textContent = truncate(s.text, 160);
+  } else if (event.type === 'message_stop') {
+    const s = state.streaming.get(sessionId);
+    if (s) s.card.classList.remove('streaming-card');
+  }
+}
+
+function finalizeAssistantMessage(envelope) {
+  const sessionId = envelope.sessionId;
+  const s = state.streaming.get(sessionId);
+  if (s && isViewingSession(sessionId)) {
+    s.summary.textContent = summarize(envelope);
+    s.card.querySelector('.event-payload').textContent = JSON.stringify(envelope.raw, null, 2);
+    s.card.classList.remove('streaming-card');
+    state.streaming.delete(sessionId);
+  } else if (isViewingSession(sessionId)) {
+    appendEventCard(envelope);
+  }
 }
 
 function touchSession(envelope) {
   const existing = state.sessions.get(envelope.sessionId);
   if (existing) {
-    existing.eventCount += 1;
+    existing.eventCount = (existing.eventCount || 0) + 1;
     existing.lastEventAt = envelope.receivedAt;
-    existing.cwd = existing.cwd || envelope.cwd;
+    if (envelope.type === 'engine' && envelope.subtype === 'exit') existing.isLive = false;
   } else {
     state.sessions.set(envelope.sessionId, {
       sessionId: envelope.sessionId,
       eventCount: 1,
-      startedAt: envelope.receivedAt,
+      createdAt: envelope.receivedAt,
       lastEventAt: envelope.receivedAt,
-      cwd: envelope.cwd,
+      isLive: true,
     });
   }
   renderSessionList();
+  if (state.selectedSession === envelope.sessionId) updateComposerVisibility();
 }
 
 function handleLiveEvent(envelope) {
   touchSession(envelope);
-  if (state.selectedSession === ALL_SESSIONS || state.selectedSession === envelope.sessionId) {
-    appendEventCard(envelope);
+
+  if (envelope.type === 'stream_event') {
+    handleStreamEvent(envelope);
+    return;
   }
+  if (envelope.type === 'assistant') {
+    finalizeAssistantMessage(envelope);
+    return;
+  }
+  if (isViewingSession(envelope.sessionId)) appendEventCard(envelope);
 }
 
 async function loadInitialSessions() {
@@ -190,20 +294,77 @@ function connectWebSocket() {
     el.statusDot.className = 'status-dot connected';
     el.statusText.textContent = 'connected';
   });
-
   ws.addEventListener('close', () => {
     el.statusDot.className = 'status-dot disconnected';
     el.statusText.textContent = 'disconnected — retrying…';
     setTimeout(connectWebSocket, 2000);
   });
-
   ws.addEventListener('error', () => ws.close());
-
   ws.addEventListener('message', (msg) => {
     const parsed = JSON.parse(msg.data);
     if (parsed.type === 'event') handleLiveEvent(parsed.data);
   });
 }
+
+el.newSessionForm.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  el.newSessionError.textContent = '';
+  const form = new FormData(el.newSessionForm);
+  const cwd = form.get('cwd').trim();
+  const prompt = form.get('prompt').trim();
+  const model = form.get('model').trim();
+  const permissionMode = form.get('permissionMode');
+
+  const body = { cwd, prompt };
+  if (model) body.model = model;
+  if (permissionMode) body.permissionMode = permissionMode;
+
+  const submitBtn = el.newSessionForm.querySelector('button[type="submit"]');
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Launching…';
+  try {
+    const res = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+    state.sessions.set(data.sessionId, {
+      sessionId: data.sessionId,
+      cwd,
+      eventCount: 0,
+      createdAt: new Date().toISOString(),
+      isLive: true,
+    });
+    el.newSessionForm.querySelector('[name="prompt"]').value = '';
+    await selectSession(data.sessionId);
+  } catch (err) {
+    el.newSessionError.textContent = err.message;
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Launch';
+  }
+});
+
+el.composer.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const input = el.composer.querySelector('[name="text"]');
+  const text = input.value.trim();
+  if (!text || state.selectedSession === ALL_SESSIONS) return;
+  input.value = '';
+  await fetch(`/api/sessions/${encodeURIComponent(state.selectedSession)}/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+});
+
+el.stopBtn.addEventListener('click', async () => {
+  if (state.selectedSession === ALL_SESSIONS) return;
+  await fetch(`/api/sessions/${encodeURIComponent(state.selectedSession)}/stop`, { method: 'POST' });
+});
 
 loadInitialSessions();
 renderSessionList();

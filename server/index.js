@@ -3,21 +3,12 @@ import { WebSocketServer } from 'ws';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { insertEvent, listSessions, listEventsForSession } from './db.js';
+import { createSession, endSession, insertEvent, listSessions, listEventsForSession } from './db.js';
+import { launchSession } from './engine.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.CLAUDE_VIEWER_PORT) || 4317;
-const PROTOCOL_VERSION = '1';
-const VALID_HOOK_EVENTS = new Set([
-  'SessionStart',
-  'UserPromptSubmit',
-  'PreToolUse',
-  'PostToolUse',
-  'Notification',
-  'Stop',
-  'SubagentStop',
-  'PreCompact',
-]);
+const PROTOCOL_VERSION = '2';
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -26,6 +17,9 @@ app.use(express.static(path.join(__dirname, '..', 'viewer')));
 /** @type {Set<import('ws').WebSocket>} */
 const wsClients = new Set();
 
+/** @type {Map<string, { engine: ReturnType<typeof launchSession>, cwd: string }>} */
+const liveSessions = new Map();
+
 function broadcast(envelope) {
   const message = JSON.stringify({ type: 'event', data: envelope });
   for (const client of wsClients) {
@@ -33,36 +27,90 @@ function broadcast(envelope) {
   }
 }
 
-app.post('/api/events', (req, res) => {
-  const body = req.body ?? {};
-  const { sessionId, hookEvent, cwd, transcriptPath, payload } = body;
-
-  if (typeof sessionId !== 'string' || !sessionId) {
-    return res.status(400).json({ error: 'sessionId is required' });
-  }
-  if (typeof hookEvent !== 'string' || !VALID_HOOK_EVENTS.has(hookEvent)) {
-    return res.status(400).json({ error: `hookEvent must be one of: ${[...VALID_HOOK_EVENTS].join(', ')}` });
-  }
-
+function ingest(sessionId, raw) {
   const envelope = {
     protocolVersion: PROTOCOL_VERSION,
     eventId: randomUUID(),
     sessionId,
     receivedAt: new Date().toISOString(),
-    hookEvent,
-    cwd: cwd ?? null,
-    transcriptPath: transcriptPath ?? null,
-    payload: payload ?? {},
+    type: raw.type,
+    subtype: raw.subtype ?? null,
+    raw,
   };
-
   insertEvent(envelope);
   broadcast(envelope);
+}
 
-  res.status(201).json({ eventId: envelope.eventId });
+app.post('/api/sessions', (req, res) => {
+  const { cwd, prompt, model, permissionMode } = req.body ?? {};
+  if (typeof cwd !== 'string' || !cwd) return res.status(400).json({ error: 'cwd is required' });
+  if (typeof prompt !== 'string' || !prompt) return res.status(400).json({ error: 'prompt is required' });
+
+  let sessionId = null;
+  let responded = false;
+
+  const startupTimer = setTimeout(() => {
+    if (!responded) {
+      responded = true;
+      res.status(504).json({ error: 'Timed out waiting for Claude Code to start' });
+    }
+  }, 20000);
+
+  const engine = launchSession({
+    cwd,
+    model,
+    permissionMode,
+    onMessage(msg) {
+      if (!sessionId && msg.session_id) {
+        sessionId = msg.session_id;
+        liveSessions.set(sessionId, { engine, cwd });
+        createSession({ sessionId, cwd, model, permissionMode });
+        if (!responded) {
+          responded = true;
+          clearTimeout(startupTimer);
+          res.status(201).json({ sessionId });
+        }
+      }
+      if (sessionId) ingest(sessionId, msg);
+    },
+    onExit({ code, signal }) {
+      if (sessionId) {
+        endSession(sessionId);
+        liveSessions.delete(sessionId);
+        ingest(sessionId, { type: 'engine', subtype: 'exit', code, signal });
+      } else if (!responded) {
+        responded = true;
+        clearTimeout(startupTimer);
+        res.status(502).json({ error: 'Claude Code exited before starting a session', code, signal });
+      }
+    },
+  });
+
+  engine.send(prompt);
+});
+
+app.post('/api/sessions/:sessionId/message', (req, res) => {
+  const live = liveSessions.get(req.params.sessionId);
+  if (!live) return res.status(404).json({ error: 'session is not live' });
+
+  const { text } = req.body ?? {};
+  if (typeof text !== 'string' || !text) return res.status(400).json({ error: 'text is required' });
+
+  live.engine.send(text);
+  res.status(202).json({ ok: true });
+});
+
+app.post('/api/sessions/:sessionId/stop', (req, res) => {
+  const live = liveSessions.get(req.params.sessionId);
+  if (!live) return res.status(404).json({ error: 'session is not live' });
+
+  live.engine.stop();
+  res.status(202).json({ ok: true });
 });
 
 app.get('/api/sessions', (req, res) => {
-  res.json(listSessions());
+  const sessions = listSessions().map((s) => ({ ...s, isLive: liveSessions.has(s.sessionId) }));
+  res.json(sessions);
 });
 
 app.get('/api/sessions/:sessionId/events', (req, res) => {
