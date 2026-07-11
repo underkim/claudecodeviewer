@@ -47,9 +47,13 @@
     </nav>
 
     <div id="timeline-wrap">
-      <main id="timeline">
-        <div id="empty-state">Launch a session, or pick one from the list to watch its live protocol stream.</div>
-      </main>
+      <div id="dashboard"></div>
+
+      <div id="detail-header" hidden>
+        <button type="button" id="back-to-dashboard">← Dashboard</button>
+        <span id="detail-title"></span>
+      </div>
+      <main id="timeline" hidden></main>
       <form id="composer" hidden>
         <input name="text" placeholder="Send a follow-up message to this session…" autocomplete="off" />
         <button type="submit">Send</button>

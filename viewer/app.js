@@ -1,4 +1,4 @@
-const ALL_SESSIONS = '__all__';
+const DASHBOARD = '__dashboard__';
 
 const BADGE_COLORS = {
   system: '#58a6ff',
@@ -25,13 +25,17 @@ const BADGE_COLORS = {
 const SUPPRESSED_TYPES = new Set(['stream_event']);
 
 const state = {
-  selectedSession: ALL_SESSIONS,
-  sessions: new Map(), // sessionId -> session summary row (+ isLive)
+  selectedSession: DASHBOARD,
+  sessions: new Map(), // sessionId -> session summary row (+ isLive, mode, activity)
   streaming: new Map(), // sessionId -> { card, textEl, text }
 };
 
 const el = {
   sessions: document.getElementById('sessions'),
+  dashboard: document.getElementById('dashboard'),
+  detailHeader: document.getElementById('detail-header'),
+  detailTitle: document.getElementById('detail-title'),
+  backToDashboardBtn: document.getElementById('back-to-dashboard'),
   timeline: document.getElementById('timeline'),
   newSessionForm: document.getElementById('new-session-form'),
   newSessionError: document.getElementById('new-session-error'),
@@ -113,14 +117,116 @@ function badgeLabel(envelope) {
   return envelope.subtype ? `${envelope.type}:${envelope.subtype}` : envelope.type;
 }
 
+// Reduces the raw protocol stream down to one human status line per
+// session, for the dashboard's at-a-glance view. Returns null for
+// message types that aren't a meaningful "what's happening now" signal
+// (rate limits, goal state, …) so the previous label just stays put.
+function deriveActivity(envelope) {
+  const raw = envelope.raw || {};
+  switch (envelope.type) {
+    case 'assistant': {
+      const blocks = raw.message?.content || [];
+      const toolUse = blocks.find((b) => b.type === 'tool_use');
+      if (toolUse) return { label: `Running ${toolUse.name}`, busy: true };
+      const text = textFromContent(blocks);
+      return { label: text ? truncate(text, 70) : 'Responding', busy: false };
+    }
+    case 'user':
+      return { label: 'Processing tool result…', busy: true };
+    case 'stream_event': {
+      const et = raw.event?.type;
+      if (et === 'message_start') return { label: 'Thinking…', busy: true };
+      if (et === 'content_block_delta') return { label: 'Responding…', busy: true };
+      return null;
+    }
+    case 'system':
+      if (envelope.subtype === 'status') {
+        return { label: raw.status === 'requesting' ? 'Waiting for response…' : 'Working…', busy: true };
+      }
+      if (envelope.subtype === 'hook_started') return { label: `Hook: ${raw.hook_name}`, busy: true };
+      return null;
+    case 'result':
+      return { label: 'Idle — turn complete', busy: false };
+    case 'queue-operation':
+      return { label: raw.operation === 'enqueue' ? 'Queued…' : 'Processing…', busy: true };
+    case 'engine':
+      return envelope.subtype === 'exit' ? { label: 'Session ended', busy: false } : null;
+    default:
+      return null;
+  }
+}
+
+function projectNameFromCwd(cwd) {
+  if (!cwd) return null;
+  const parts = cwd.replace(/[\\/]+$/, '').split(/[\\/]/);
+  return parts[parts.length - 1] || cwd;
+}
+
 function renderSessionList() {
   const sessions = [...state.sessions.values()].sort((a, b) =>
     (b.lastEventAt || b.createdAt || '').localeCompare(a.lastEventAt || a.createdAt || '')
   );
 
   el.sessions.innerHTML = '';
-  el.sessions.appendChild(buildSessionItem({ sessionId: ALL_SESSIONS, label: 'All sessions (live)' }));
+  el.sessions.appendChild(buildSessionItem({ sessionId: DASHBOARD, label: 'Dashboard' }));
   for (const s of sessions) el.sessions.appendChild(buildSessionItem(s));
+}
+
+function renderDashboard() {
+  const sessions = [...state.sessions.values()].sort((a, b) =>
+    (b.lastEventAt || b.createdAt || '').localeCompare(a.lastEventAt || a.createdAt || '')
+  );
+
+  el.dashboard.innerHTML = '';
+
+  if (sessions.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'dashboard-empty';
+    empty.textContent = 'No sessions yet — launch one or attach to a running session from the sidebar.';
+    el.dashboard.appendChild(empty);
+    return;
+  }
+
+  for (const s of sessions) el.dashboard.appendChild(buildProjectCard(s));
+}
+
+function buildProjectCard(s) {
+  const card = document.createElement('div');
+  card.className = 'project-card';
+
+  const head = document.createElement('div');
+  head.className = 'project-card-head';
+  if (s.isLive) {
+    const dot = document.createElement('span');
+    dot.className = 'live-dot';
+    head.appendChild(dot);
+  }
+  const name = document.createElement('span');
+  name.className = 'project-name';
+  name.textContent = projectNameFromCwd(s.cwd) || s.sessionId.slice(0, 8);
+  head.appendChild(name);
+  card.appendChild(head);
+
+  const cwd = document.createElement('div');
+  cwd.className = 'project-cwd';
+  cwd.title = s.cwd || '';
+  cwd.textContent = s.cwd || '';
+  card.appendChild(cwd);
+
+  const activity = document.createElement('div');
+  const busy = s.isLive && s.activity?.busy;
+  activity.className = 'project-activity ' + (!s.isLive ? 'state-ended' : busy ? 'state-busy' : 'state-idle');
+  activity.textContent = s.activity?.label || (s.isLive ? 'Active' : 'Ended');
+  card.appendChild(activity);
+
+  const footer = document.createElement('div');
+  footer.className = 'project-footer';
+  const suffix = s.mode === 'attached' ? ' · attached' : '';
+  footer.textContent = `${formatRelative(s.lastEventAt || s.createdAt)} · ${s.eventCount ?? 0} events${suffix}`;
+  card.appendChild(footer);
+
+  card.addEventListener('click', () => selectSession(s.sessionId));
+  return card;
 }
 
 function buildSessionItem(s) {
@@ -169,16 +275,22 @@ function updateComposerVisibility() {
 async function selectSession(sessionId) {
   state.selectedSession = sessionId;
   renderSessionList();
-  el.timeline.innerHTML = '';
-  updateComposerVisibility();
 
-  if (sessionId === ALL_SESSIONS) {
-    const empty = document.createElement('div');
-    empty.id = 'empty-state';
-    empty.textContent = 'Watching all sessions — showing new events as they arrive.';
-    el.timeline.appendChild(empty);
+  if (sessionId === DASHBOARD) {
+    el.dashboard.hidden = false;
+    el.detailHeader.hidden = true;
+    el.timeline.hidden = true;
+    el.composer.hidden = true;
+    renderDashboard();
     return;
   }
+
+  el.dashboard.hidden = true;
+  el.detailHeader.hidden = false;
+  el.timeline.hidden = false;
+  el.detailTitle.textContent = projectNameFromCwd(state.sessions.get(sessionId)?.cwd) || sessionId.slice(0, 12);
+  el.timeline.innerHTML = '';
+  updateComposerVisibility();
 
   const events = await window.viewerAPI.getSessionEvents(sessionId);
   for (const e of events) {
@@ -189,9 +301,6 @@ async function selectSession(sessionId) {
 }
 
 function appendEventCard(envelope) {
-  const emptyState = document.getElementById('empty-state');
-  if (emptyState && state.selectedSession !== ALL_SESSIONS) emptyState.remove();
-
   const card = document.createElement('div');
   card.className = 'event-card' + (envelope.type === 'engine' ? ' engine-card' : '');
 
@@ -228,7 +337,7 @@ function appendEventCard(envelope) {
 }
 
 function isViewingSession(sessionId) {
-  return state.selectedSession === ALL_SESSIONS || state.selectedSession === sessionId;
+  return state.selectedSession === sessionId;
 }
 
 // Folds token-by-token stream_event deltas into one live-updating card per
@@ -277,21 +386,32 @@ function finalizeAssistantMessage(envelope) {
 }
 
 function touchSession(envelope) {
+  const activity = deriveActivity(envelope);
   const existing = state.sessions.get(envelope.sessionId);
   if (existing) {
     existing.eventCount = (existing.eventCount || 0) + 1;
     existing.lastEventAt = envelope.receivedAt;
     if (envelope.type === 'engine' && envelope.subtype === 'exit') existing.isLive = false;
+    if (activity) existing.activity = activity;
+    // Normally set explicitly by the create/attach handlers before this
+    // ever runs — but their IPC response and this live push aren't
+    // strictly ordered, so backfill cwd if this session's first-seen
+    // event beat that response here.
+    if (!existing.cwd && envelope.raw?.cwd) existing.cwd = envelope.raw.cwd;
   } else {
     state.sessions.set(envelope.sessionId, {
       sessionId: envelope.sessionId,
+      cwd: envelope.raw?.cwd,
       eventCount: 1,
       createdAt: envelope.receivedAt,
       lastEventAt: envelope.receivedAt,
       isLive: true,
+      mode: 'spawned',
+      activity: activity || { label: 'Starting…', busy: true },
     });
   }
   renderSessionList();
+  if (state.selectedSession === DASHBOARD) renderDashboard();
   if (state.selectedSession === envelope.sessionId) updateComposerVisibility();
 }
 
@@ -365,6 +485,7 @@ async function attachToDiscovered(item) {
     createdAt: new Date().toISOString(),
     isLive: true,
     mode: 'attached',
+    activity: { label: 'Watching…', busy: false },
   });
   await selectSession(data.sessionId);
   loadDiscoverList();
@@ -396,6 +517,7 @@ el.newSessionForm.addEventListener('submit', async (ev) => {
       createdAt: new Date().toISOString(),
       isLive: true,
       mode: 'spawned',
+      activity: { label: 'Starting…', busy: true },
     });
     el.newSessionForm.querySelector('[name="prompt"]').value = '';
     await selectSession(data.sessionId);
@@ -416,13 +538,13 @@ el.composer.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const input = el.composer.querySelector('[name="text"]');
   const text = input.value.trim();
-  if (!text || state.selectedSession === ALL_SESSIONS) return;
+  if (!text || state.selectedSession === DASHBOARD) return;
   input.value = '';
   await window.viewerAPI.sendMessage(state.selectedSession, text);
 });
 
 el.stopBtn.addEventListener('click', async () => {
-  if (state.selectedSession === ALL_SESSIONS) return;
+  if (state.selectedSession === DASHBOARD) return;
   const s = state.sessions.get(state.selectedSession);
   if (s && s.mode === 'attached') {
     await window.viewerAPI.detachSession(state.selectedSession);
@@ -432,8 +554,11 @@ el.stopBtn.addEventListener('click', async () => {
 });
 
 el.discoverRefreshBtn.addEventListener('click', loadDiscoverList);
+el.backToDashboardBtn.addEventListener('click', () => selectSession(DASHBOARD));
 
-loadInitialSessions();
+(async () => {
+  await loadInitialSessions();
+  await selectSession(DASHBOARD);
+})();
 loadDiscoverList();
-renderSessionList();
 window.viewerAPI.onEvent(handleLiveEvent);

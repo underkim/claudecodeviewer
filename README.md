@@ -29,14 +29,19 @@ SQLite (core/db.js)
    persists every message verbatim to SQLite (`core/db.js`), and pushes
    each one to the renderer window the instant it arrives. It also
    exposes a native OS folder picker for choosing a project directory.
-3. **Renderer** (`viewer/`) — the window contents: launch a new session
-   (working directory + prompt) or pick a running one, and watch its
-   assistant text stream in token-by-token, tool calls, hook activity,
-   and turn results as color-coded cards. A composer lets you send
-   follow-up messages to a live session, or stop it. It never touches the
-   filesystem or spawns processes itself — everything goes through
-   `window.viewerAPI` (`electron/preload.cjs`), an IPC bridge with no
-   direct Node or OS access.
+3. **Renderer** (`viewer/`) — the window contents. The default view is a
+   **dashboard**: one card per session, showing its project name, whether
+   it's live, and a one-line status derived from its latest events
+   (`Running Bash`, `Thinking…`, `Idle — turn complete`, `Session ended`,
+   color-coded busy/idle/ended) — the "what's going on across everything"
+   view, updating live as events stream in. Click a card to drop into
+   that session's detail view: the full event timeline, token-by-token
+   assistant text, tool calls, hook activity, and turn results as
+   color-coded cards, with a composer to send follow-up messages or stop
+   it, and a back button to return to the dashboard. The renderer never
+   touches the filesystem or spawns processes itself — everything goes
+   through `window.viewerAPI` (`electron/preload.cjs`), an IPC bridge with
+   no direct Node or OS access.
 
 ### Watching a session you didn't launch from the app
 
@@ -64,10 +69,11 @@ npm install
 npm start
 ```
 
-This opens the app window. Fill in a working directory (or use Browse…)
-and a prompt in the "New session" panel, and hit Launch. The session's
-output streams in live; use the composer at the bottom to send follow-up
-turns, or Stop to end it.
+This opens the app window on the dashboard. Fill in a working directory
+(or use Browse…) and a prompt in the "New session" panel, and hit Launch
+— its card appears on the dashboard immediately, and clicking it shows
+the live output; use the composer at the bottom to send follow-up turns,
+or Stop to end it, or the back button to return to the dashboard.
 
 To watch a session running somewhere else instead, use "Attach to a
 running session" in the sidebar — Refresh to list recently active Claude
