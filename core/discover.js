@@ -2,7 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+// Overridable so tests can point discovery at a synthetic directory
+// instead of the real ~/.claude.
+export const PROJECTS_DIR =
+  process.env.CLAUDE_VIEWER_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
 
 // Every message in a transcript carries its own `cwd`, so peeking at the
 // first few KB (rather than decoding the lossy, hyphen-joined project
@@ -35,8 +38,10 @@ function peekCwd(filePath) {
 
 /**
  * Scans ~/.claude/projects for transcript files, most recently modified
- * first, so the app can offer "attach to a session already running
- * elsewhere" without the user hunting down a file path themselves.
+ * first. This is the app's entire notion of "what sessions exist" — every
+ * session Claude Code has ever run on this machine has a transcript here,
+ * so a scan needs no registration step and no cooperation from the
+ * session's side.
  */
 export function discoverSessions() {
   const results = [];

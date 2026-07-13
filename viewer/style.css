@@ -84,58 +84,8 @@ header h1 {
   margin-bottom: 2px;
 }
 
-#discover-panel {
-  padding: 12px;
-  border-bottom: 1px solid var(--border);
-  max-height: 220px;
-  display: flex;
-  flex-direction: column;
-}
-.form-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 6px;
-}
-.form-title-row .form-title { margin-bottom: 0; }
-#discover-refresh-btn {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  color: var(--text);
-  border-radius: 4px;
-  padding: 3px 8px;
-  font-size: 11px;
-  cursor: pointer;
-}
-#discover-refresh-btn:hover { background: #1c2129; }
-#discover-list {
-  overflow-y: auto;
-  font-size: 12px;
-}
-.discover-empty {
-  color: var(--text-dim);
-  font-size: 11.5px;
-}
-.discover-item {
-  padding: 6px 8px;
-  border-radius: 4px;
-  cursor: pointer;
-  margin-bottom: 4px;
-  border: 1px solid transparent;
-}
-.discover-item:hover { background: #1c2129; border-color: var(--border); }
-.discover-item .cwd {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.discover-item .meta {
-  font-size: 10.5px;
-  color: var(--text-dim);
-  margin-top: 2px;
+.sidebar-title {
+  padding: 12px 14px 6px;
 }
 
 #sessions {
@@ -282,31 +232,6 @@ header h1 {
 .project-footer {
   font-size: 11px;
   color: var(--text-dim);
-}
-
-#composer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 16px;
-  border-top: 1px solid var(--border);
-  background: var(--bg-panel);
-}
-#composer[hidden] { display: none; }
-.composer-note {
-  flex: 1;
-  font-size: 12px;
-  color: var(--text-dim);
-}
-#detach-btn {
-  background: #f85149;
-  color: #0d1117;
-  border: none;
-  border-radius: 4px;
-  padding: 8px 14px;
-  font-weight: 600;
-  cursor: pointer;
-  font-size: 12.5px;
 }
 
 #settings-panel {

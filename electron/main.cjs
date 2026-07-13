@@ -2,38 +2,28 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
-const crypto = require('node:crypto');
 
-// core/db.js, core/tail.js, core/discover.js are ES modules (root
-// package.json sets "type": "module"); this file stays CommonJS so
-// Electron's preload/main loading never has to guess which module system
-// applies, and pulls them in with a dynamic import instead.
-let db;
-let tail;
+// The core/ modules are ES modules (root package.json sets "type":
+// "module"); this file stays CommonJS so Electron's preload/main loading
+// never has to guess which module system applies, and pulls them in with
+// a dynamic import instead.
 let discover;
+let transcript;
+let watch;
 
-/** @type {Map<string, { tail: ReturnType<typeof tail.attachToTranscript>, cwd: string }>} */
-const attachedSessions = new Map();
 let mainWindow;
+let watcher;
+
+// A session counts as live if its transcript was written to recently.
+// Liveness can't be read off a process table (the app never owns or even
+// knows the claude processes), and a session that hasn't logged anything
+// in this long is idle in every way that matters to a viewer.
+const LIVE_WINDOW_MS = 5 * 60 * 1000;
 
 function broadcast(envelope) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('viewer:event', envelope);
   }
-}
-
-function ingest(sessionId, raw) {
-  const envelope = {
-    protocolVersion: '2',
-    eventId: crypto.randomUUID(),
-    sessionId,
-    receivedAt: new Date().toISOString(),
-    type: raw.type,
-    subtype: raw.subtype ?? null,
-    raw,
-  };
-  db.insertEvent(envelope);
-  broadcast(envelope);
 }
 
 function createWindow() {
@@ -52,9 +42,15 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  db = await import('../core/db.js');
-  tail = await import('../core/tail.js');
   discover = await import('../core/discover.js');
+  transcript = await import('../core/transcript.js');
+  watch = await import('../core/watch.js');
+
+  watcher = watch.watchProjects({
+    onMessage(sessionId, raw, transcriptPath) {
+      broadcast(transcript.wrapEnvelope(sessionId, raw, new Date().toISOString(), transcriptPath));
+    },
+  });
 
   createWindow();
   app.on('activate', () => {
@@ -63,46 +59,46 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  for (const attached of attachedSessions.values()) attached.tail.detach();
+  if (watcher) watcher.close();
   if (process.platform !== 'darwin') app.quit();
 });
 
 ipcMain.handle('sessions:list', () => {
-  return db.listSessions().map((s) => ({ ...s, isLive: attachedSessions.has(s.sessionId) }));
+  const now = Date.now();
+  return discover.discoverSessions().map((s) => ({
+    sessionId: s.sessionId,
+    cwd: s.cwd,
+    transcriptPath: s.transcriptPath,
+    lastEventAt: s.lastModified,
+    isLive: now - new Date(s.lastModified).getTime() < LIVE_WINDOW_MS,
+  }));
 });
 
-ipcMain.handle('sessions:discover', () => {
-  return discover.discoverSessions().filter((s) => !attachedSessions.has(s.sessionId));
-});
-
-ipcMain.handle('sessions:attach', (_event, { sessionId, transcriptPath, cwd }) => {
-  if (attachedSessions.has(sessionId)) {
-    throw new Error('already tracking this session');
+// The renderer sends back a transcriptPath it previously got from
+// sessions:list — but it's still renderer-supplied input, so refuse
+// anything that resolves outside the projects directory.
+function assertInsideProjectsDir(transcriptPath) {
+  const resolved = path.resolve(transcriptPath);
+  const root = path.resolve(discover.PROJECTS_DIR);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw new Error('transcript path is outside the Claude Code projects directory');
   }
+  return resolved;
+}
 
-  db.createSession({ sessionId, cwd });
-
-  const handle = tail.attachToTranscript(transcriptPath, {
-    onMessage(msg) { ingest(sessionId, msg); },
-    onError(err) { ingest(sessionId, { type: 'engine', subtype: 'stderr', text: String(err) }); },
-  });
-  attachedSessions.set(sessionId, { tail: handle, cwd });
-
-  return { sessionId };
+ipcMain.handle('sessions:events', (_event, transcriptPath) => {
+  return transcript.readTranscriptEvents(assertInsideProjectsDir(transcriptPath));
 });
 
-ipcMain.handle('sessions:detach', (_event, { sessionId }) => {
-  const attached = attachedSessions.get(sessionId);
-  if (!attached) throw new Error('session is not attached');
-  attached.tail.detach();
-  attachedSessions.delete(sessionId);
-  db.endSession(sessionId);
-  return { ok: true };
+ipcMain.handle('sessions:eventsForCwd', (_event, cwd) => {
+  const events = [];
+  for (const s of discover.discoverSessions()) {
+    if (s.cwd !== cwd) continue;
+    events.push(...transcript.readTranscriptEvents(s.transcriptPath));
+  }
+  events.sort((a, b) => (a.receivedAt || '').localeCompare(b.receivedAt || ''));
+  return events;
 });
-
-ipcMain.handle('sessions:events', (_event, sessionId) => db.listEventsForSession(sessionId));
-
-ipcMain.handle('sessions:eventsForCwd', (_event, cwd) => db.listEventsForCwd(cwd));
 
 function globalSettingsPath() {
   return path.join(os.homedir(), '.claude', 'settings.json');

@@ -15,14 +15,7 @@
     </header>
 
     <nav id="sidebar">
-      <div id="discover-panel">
-        <div class="form-title-row">
-          <span class="form-title">Attach to a running session</span>
-          <button type="button" id="discover-refresh-btn">Refresh</button>
-        </div>
-        <div id="discover-list"></div>
-      </div>
-
+      <div class="sidebar-title form-title">Sessions</div>
       <div id="sessions"></div>
     </nav>
 
@@ -72,10 +65,6 @@
         <span id="detail-title"></span>
       </div>
       <main id="timeline" hidden></main>
-      <form id="composer" hidden>
-        <span class="composer-note">Read-only — attached to this session's transcript</span>
-        <button type="button" id="detach-btn">Detach</button>
-      </form>
     </div>
   </div>
   <script src="app.js"></script>

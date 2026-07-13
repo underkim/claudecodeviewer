@@ -2,6 +2,10 @@ const DASHBOARD = '__dashboard__';
 const SETTINGS = '__settings__';
 const PROJECT = '__project__';
 
+// Must stay in sync with LIVE_WINDOW_MS in electron/main.cjs: a session
+// whose transcript hasn't been written in this long is shown as ended.
+const LIVE_WINDOW_MS = 5 * 60 * 1000;
+
 const BADGE_COLORS = {
   system: '#58a6ff',
   assistant: '#3fb950',
@@ -10,10 +14,6 @@ const BADGE_COLORS = {
   rate_limit_event: '#8b949e',
   active_goal: '#8b949e',
   engine: '#f85149',
-  // These only ever come from tailing an attached session's transcript
-  // file (core/tail.js) — the durable per-session log Claude Code keeps
-  // has a different, plainer message shape than the live stream-json
-  // protocol a spawned session speaks.
   'queue-operation': '#6e7681',
   attachment: '#6e7681',
   'ai-title': '#6e7681',
@@ -21,16 +21,10 @@ const BADGE_COLORS = {
   mode: '#6e7681',
 };
 
-// Raw protocol message types that only exist to drive the live "typing"
-// effect — they're folded into the assistant card they belong to and never
-// get their own row, in history or live.
-const SUPPRESSED_TYPES = new Set(['stream_event']);
-
 const state = {
   selectedSession: DASHBOARD,
   selectedProjectCwd: null,
-  sessions: new Map(), // sessionId -> session summary row (+ isLive, activity)
-  streaming: new Map(), // sessionId -> { card, textEl, text }
+  sessions: new Map(), // sessionId -> { sessionId, cwd, transcriptPath, lastEventAt, activity }
 };
 
 let projectRefreshTimer = null;
@@ -42,10 +36,6 @@ const el = {
   detailTitle: document.getElementById('detail-title'),
   backToDashboardBtn: document.getElementById('back-to-dashboard'),
   timeline: document.getElementById('timeline'),
-  composer: document.getElementById('composer'),
-  detachBtn: document.getElementById('detach-btn'),
-  discoverList: document.getElementById('discover-list'),
-  discoverRefreshBtn: document.getElementById('discover-refresh-btn'),
   settingsBtn: document.getElementById('settings-btn'),
   settingsPanel: document.getElementById('settings-panel'),
   settingsPath: document.getElementById('settings-path'),
@@ -70,6 +60,22 @@ function truncate(str, n) {
 
 function formatTime(iso) {
   return new Date(iso).toLocaleTimeString([], { hour12: false });
+}
+
+function formatRelative(iso) {
+  if (!iso) return '';
+  const totalSeconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s ago`;
+  const minutes = Math.floor(totalSeconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function isSessionLive(s) {
+  if (!s.lastEventAt) return false;
+  return Date.now() - new Date(s.lastEventAt).getTime() < LIVE_WINDOW_MS;
 }
 
 function textFromContent(content) {
@@ -111,7 +117,6 @@ function summarize(envelope) {
     case 'active_goal':
       return raw.value ? truncate(raw.value, 120) : '(cleared)';
     case 'engine':
-      if (envelope.subtype === 'exit') return `process exited (code ${raw.code}, signal ${raw.signal})`;
       if (envelope.subtype === 'stderr') return truncate(raw.text, 160);
       return truncate(raw.text || '', 160);
     case 'queue-operation':
@@ -133,10 +138,10 @@ function badgeLabel(envelope) {
   return envelope.subtype ? `${envelope.type}:${envelope.subtype}` : envelope.type;
 }
 
-// Reduces the raw protocol stream down to one human status line per
+// Reduces the transcript stream down to one human status line per
 // session, for the dashboard's at-a-glance view. Returns null for
 // message types that aren't a meaningful "what's happening now" signal
-// (rate limits, goal state, …) so the previous label just stays put.
+// so the previous label just stays put.
 function deriveActivity(envelope) {
   const raw = envelope.raw || {};
   switch (envelope.type) {
@@ -147,26 +152,17 @@ function deriveActivity(envelope) {
       const text = textFromContent(blocks);
       return { label: text ? truncate(text, 70) : 'Responding', busy: false };
     }
-    case 'user':
-      return { label: 'Processing tool result…', busy: true };
-    case 'stream_event': {
-      const et = raw.event?.type;
-      if (et === 'message_start') return { label: 'Thinking…', busy: true };
-      if (et === 'content_block_delta') return { label: 'Responding…', busy: true };
-      return null;
+    case 'user': {
+      const blocks = raw.message?.content || [];
+      const hasToolResult = Array.isArray(blocks) && blocks.some((b) => b.type === 'tool_result');
+      return hasToolResult
+        ? { label: 'Processing tool result…', busy: true }
+        : { label: 'New prompt received', busy: true };
     }
-    case 'system':
-      if (envelope.subtype === 'status') {
-        return { label: raw.status === 'requesting' ? 'Waiting for response…' : 'Working…', busy: true };
-      }
-      if (envelope.subtype === 'hook_started') return { label: `Hook: ${raw.hook_name}`, busy: true };
-      return null;
-    case 'result':
-      return { label: 'Idle — turn complete', busy: false };
     case 'queue-operation':
       return { label: raw.operation === 'enqueue' ? 'Queued…' : 'Processing…', busy: true };
-    case 'engine':
-      return envelope.subtype === 'exit' ? { label: 'Session ended', busy: false } : null;
+    case 'ai-title':
+      return raw.aiTitle ? { label: truncate(raw.aiTitle, 70), busy: true } : null;
     default:
       return null;
   }
@@ -203,9 +199,6 @@ function applyTaskResult(tasks, toolUse, resultBlock) {
       if (toolUse.input.status) existing.status = toolUse.input.status;
       if (toolUse.input.subject) existing.subject = toolUse.input.subject;
     } else {
-      // The TaskCreate that made this id predates what we're looking at
-      // (an older session outside this project's recorded history) —
-      // still record the update so the task shows up.
       tasks.set(taskId, {
         id: taskId,
         subject: toolUse.input.subject || `Task #${taskId}`,
@@ -217,7 +210,7 @@ function applyTaskResult(tasks, toolUse, resultBlock) {
 
 // Reduces a project's full event history down to tool-usage counts,
 // files touched, turn counts, and a task roadmap — the "stats" and
-// "roadmap" the dashboard's project view shows.
+// "roadmap" the project view shows.
 function computeProjectStats(events) {
   const toolCounts = new Map();
   const filesTouched = new Set();
@@ -241,6 +234,7 @@ function computeProjectStats(events) {
     } else if (e.type === 'user') {
       userTurns++;
       const blocks = raw.message?.content || [];
+      if (!Array.isArray(blocks)) continue;
       for (const b of blocks) {
         if (b.type !== 'tool_result') continue;
         const toolUse = pendingToolUses.get(b.tool_use_id);
@@ -254,14 +248,44 @@ function computeProjectStats(events) {
   return { toolCounts, filesTouched, tasks, userTurns, assistantTurns };
 }
 
-function renderSessionList() {
-  const sessions = [...state.sessions.values()].sort((a, b) =>
-    (b.lastEventAt || b.createdAt || '').localeCompare(a.lastEventAt || a.createdAt || '')
+function sortedSessions() {
+  return [...state.sessions.values()].sort((a, b) =>
+    (b.lastEventAt || '').localeCompare(a.lastEventAt || '')
   );
+}
 
+function renderSessionList() {
   el.sessions.innerHTML = '';
   el.sessions.appendChild(buildSessionItem({ sessionId: DASHBOARD, label: 'Dashboard' }));
-  for (const s of sessions) el.sessions.appendChild(buildSessionItem(s));
+  for (const s of sortedSessions()) el.sessions.appendChild(buildSessionItem(s));
+}
+
+function buildSessionItem(s) {
+  const div = document.createElement('div');
+  div.className = 'session-item' + (state.selectedSession === s.sessionId ? ' active' : '');
+
+  const row = document.createElement('div');
+  row.className = 'sid-row';
+  if (!s.label && isSessionLive(s)) {
+    const dot = document.createElement('span');
+    dot.className = 'live-dot';
+    row.appendChild(dot);
+  }
+  const sid = document.createElement('span');
+  sid.className = 'sid';
+  sid.textContent = s.label || s.sessionId.slice(0, 12);
+  row.appendChild(sid);
+  div.appendChild(row);
+
+  if (!s.label) {
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = `${formatRelative(s.lastEventAt)} · ${s.cwd || ''}`;
+    div.appendChild(meta);
+  }
+
+  div.addEventListener('click', () => selectSession(s.sessionId));
+  return div;
 }
 
 function groupSessionsByProject() {
@@ -281,16 +305,14 @@ function renderDashboard() {
   if (projects.size === 0) {
     const empty = document.createElement('div');
     empty.className = 'dashboard-empty';
-    empty.textContent = 'No sessions yet — attach to a running session from the sidebar.';
+    empty.textContent =
+      'No Claude Code sessions found on this machine yet — run claude in any project and it will appear here automatically.';
     el.dashboard.appendChild(empty);
     return;
   }
 
   const lastActive = (sessions) =>
-    sessions.reduce((max, s) => {
-      const t = s.lastEventAt || s.createdAt || '';
-      return t > max ? t : max;
-    }, '');
+    sessions.reduce((max, s) => ((s.lastEventAt || '') > max ? s.lastEventAt : max), '');
 
   const entries = [...projects.entries()].sort((a, b) => lastActive(b[1]).localeCompare(lastActive(a[1])));
   for (const [cwd, sessions] of entries) el.dashboard.appendChild(buildProjectSummaryCard(cwd, sessions));
@@ -300,10 +322,11 @@ function buildProjectSummaryCard(cwd, sessions) {
   const card = document.createElement('div');
   card.className = 'project-card';
 
+  const liveSessions = sessions.filter(isSessionLive);
+
   const head = document.createElement('div');
   head.className = 'project-card-head';
-  const liveCount = sessions.filter((s) => s.isLive).length;
-  if (liveCount > 0) {
+  if (liveSessions.length > 0) {
     const dot = document.createElement('span');
     dot.className = 'live-dot';
     head.appendChild(dot);
@@ -320,26 +343,21 @@ function buildProjectSummaryCard(cwd, sessions) {
   cwdEl.textContent = cwd;
   card.appendChild(cwdEl);
 
-  const busySession = sessions.find((s) => s.isLive && s.activity?.busy);
+  const busySession = liveSessions.find((s) => s.activity?.busy);
   const activityEl = document.createElement('div');
   activityEl.className =
-    'project-activity ' + (busySession ? 'state-busy' : liveCount > 0 ? 'state-idle' : 'state-ended');
+    'project-activity ' + (busySession ? 'state-busy' : liveSessions.length > 0 ? 'state-idle' : 'state-ended');
   activityEl.textContent = busySession
     ? busySession.activity.label
-    : liveCount > 0
-      ? `${liveCount} session${liveCount > 1 ? 's' : ''} active`
-      : 'Ended';
+    : liveSessions.length > 0
+      ? `${liveSessions.length} session${liveSessions.length > 1 ? 's' : ''} active`
+      : 'Idle';
   card.appendChild(activityEl);
 
-  const lastEventAt = sessions.reduce((max, s) => {
-    const t = s.lastEventAt || s.createdAt || '';
-    return t > max ? t : max;
-  }, '');
-  const totalEvents = sessions.reduce((sum, s) => sum + (s.eventCount || 0), 0);
-
+  const lastEventAt = sessions.reduce((max, s) => ((s.lastEventAt || '') > max ? s.lastEventAt : max), '');
   const footer = document.createElement('div');
   footer.className = 'project-footer';
-  footer.textContent = `${formatRelative(lastEventAt)} · ${sessions.length} session${sessions.length > 1 ? 's' : ''} · ${totalEvents} events`;
+  footer.textContent = `${formatRelative(lastEventAt)} · ${sessions.length} session${sessions.length > 1 ? 's' : ''}`;
   card.appendChild(footer);
 
   card.addEventListener('click', () => showProject(cwd));
@@ -355,7 +373,6 @@ async function showProject(cwd) {
   el.settingsPanel.hidden = true;
   el.detailHeader.hidden = true;
   el.timeline.hidden = true;
-  el.composer.hidden = true;
   el.projectPanel.hidden = false;
 
   await renderProjectPanel(cwd);
@@ -376,7 +393,7 @@ async function renderProjectPanel(cwd) {
 
 function renderStatTiles(sessions, stats) {
   el.projectStats.innerHTML = '';
-  const liveCount = sessions.filter((s) => s.isLive).length;
+  const liveCount = sessions.filter(isSessionLive).length;
   const totalToolCalls = [...stats.toolCounts.values()].reduce((a, b) => a + b, 0);
 
   const tiles = [
@@ -460,13 +477,11 @@ function renderRoadmap(tasksMap) {
 
 function renderProjectSessionList(sessions) {
   el.projectSessions.innerHTML = '';
-  const sorted = [...sessions].sort((a, b) =>
-    (b.lastEventAt || b.createdAt || '').localeCompare(a.lastEventAt || a.createdAt || '')
-  );
+  const sorted = [...sessions].sort((a, b) => (b.lastEventAt || '').localeCompare(a.lastEventAt || ''));
   for (const s of sorted) {
     const row = document.createElement('div');
     row.className = 'project-session-row';
-    if (s.isLive) {
+    if (isSessionLive(s)) {
       const dot = document.createElement('span');
       dot.className = 'live-dot';
       row.appendChild(dot);
@@ -477,7 +492,7 @@ function renderProjectSessionList(sessions) {
     row.appendChild(label);
     const activity = document.createElement('span');
     activity.className = 'project-session-activity';
-    activity.textContent = s.activity?.label || (s.isLive ? 'Active' : 'Ended');
+    activity.textContent = s.activity?.label || formatRelative(s.lastEventAt);
     row.appendChild(activity);
     row.addEventListener('click', () => selectSession(s.sessionId));
     el.projectSessions.appendChild(row);
@@ -494,42 +509,6 @@ function scheduleProjectPanelRefresh(cwd) {
   }, 400);
 }
 
-function buildSessionItem(s) {
-  const div = document.createElement('div');
-  div.className = 'session-item' + (state.selectedSession === s.sessionId ? ' active' : '');
-
-  const row = document.createElement('div');
-  row.className = 'sid-row';
-  if (s.isLive) {
-    const dot = document.createElement('span');
-    dot.className = 'live-dot';
-    row.appendChild(dot);
-  }
-  const sid = document.createElement('span');
-  sid.className = 'sid';
-  sid.textContent = s.label || s.sessionId.slice(0, 12);
-  row.appendChild(sid);
-  div.appendChild(row);
-
-  if (!s.label) {
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.textContent = `${s.eventCount ?? 0} events · ${s.cwd || ''}`;
-    div.appendChild(meta);
-  }
-
-  div.addEventListener('click', () => selectSession(s.sessionId));
-  return div;
-}
-
-// Every session this app tracks is attached (read-only), never spawned —
-// it never gives Claude Code any instructions, only watches. Composer
-// visibility is just "is this session still live to watch".
-function updateComposerVisibility() {
-  const s = state.sessions.get(state.selectedSession);
-  el.composer.hidden = !(s && s.isLive);
-}
-
 async function selectSession(sessionId) {
   state.selectedSession = sessionId;
   renderSessionList();
@@ -540,7 +519,6 @@ async function selectSession(sessionId) {
     el.settingsPanel.hidden = true;
     el.detailHeader.hidden = true;
     el.timeline.hidden = true;
-    el.composer.hidden = true;
     renderDashboard();
     return;
   }
@@ -551,7 +529,6 @@ async function selectSession(sessionId) {
     el.settingsPanel.hidden = false;
     el.detailHeader.hidden = true;
     el.timeline.hidden = true;
-    el.composer.hidden = true;
     await loadSettingsPanel();
     return;
   }
@@ -561,16 +538,16 @@ async function selectSession(sessionId) {
   el.settingsPanel.hidden = true;
   el.detailHeader.hidden = false;
   el.timeline.hidden = false;
-  el.detailTitle.textContent = projectNameFromCwd(state.sessions.get(sessionId)?.cwd) || sessionId.slice(0, 12);
-  el.timeline.innerHTML = '';
-  updateComposerVisibility();
 
-  const events = await window.viewerAPI.getSessionEvents(sessionId);
-  for (const e of events) {
-    if (SUPPRESSED_TYPES.has(e.type)) continue;
-    appendEventCard(e);
+  const session = state.sessions.get(sessionId);
+  el.detailTitle.textContent = projectNameFromCwd(session?.cwd) || sessionId.slice(0, 12);
+  el.timeline.innerHTML = '';
+
+  if (session?.transcriptPath) {
+    const events = await window.viewerAPI.getSessionEvents(session.transcriptPath);
+    for (const e of events) appendEventCard(e);
+    el.timeline.scrollTop = el.timeline.scrollHeight;
   }
-  el.timeline.scrollTop = el.timeline.scrollHeight;
 }
 
 async function loadSettingsPanel() {
@@ -617,82 +594,25 @@ function appendEventCard(envelope) {
   return { card, summary };
 }
 
-function isViewingSession(sessionId) {
-  return state.selectedSession === sessionId;
-}
-
-// Folds token-by-token stream_event deltas into one live-updating card per
-// in-flight assistant turn, so the browser shows text arriving the way it
-// would in a terminal, instead of one DOM node per token.
-function handleStreamEvent(envelope) {
-  const sessionId = envelope.sessionId;
-  const event = envelope.raw.event || {};
-
-  if (event.type === 'message_start') {
-    if (!isViewingSession(sessionId)) return;
-    const placeholder = {
-      protocolVersion: envelope.protocolVersion,
-      eventId: envelope.eventId,
-      sessionId,
-      receivedAt: envelope.receivedAt,
-      type: 'assistant',
-      subtype: null,
-      raw: { message: { content: [{ type: 'text', text: '' }] } },
-    };
-    const { card, summary } = appendEventCard(placeholder);
-    card.classList.add('streaming-card');
-    state.streaming.set(sessionId, { card, summary, text: '' });
-  } else if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-    const s = state.streaming.get(sessionId);
-    if (!s) return;
-    s.text += event.delta.text;
-    s.summary.textContent = truncate(s.text, 160);
-  } else if (event.type === 'message_stop') {
-    const s = state.streaming.get(sessionId);
-    if (s) s.card.classList.remove('streaming-card');
-  }
-}
-
-function finalizeAssistantMessage(envelope) {
-  const sessionId = envelope.sessionId;
-  const s = state.streaming.get(sessionId);
-  if (s && isViewingSession(sessionId)) {
-    s.summary.textContent = summarize(envelope);
-    s.card.querySelector('.event-payload').textContent = JSON.stringify(envelope.raw, null, 2);
-    s.card.classList.remove('streaming-card');
-    state.streaming.delete(sessionId);
-  } else if (isViewingSession(sessionId)) {
-    appendEventCard(envelope);
-  }
-}
-
 function touchSession(envelope) {
   const activity = deriveActivity(envelope);
   const existing = state.sessions.get(envelope.sessionId);
   if (existing) {
-    existing.eventCount = (existing.eventCount || 0) + 1;
     existing.lastEventAt = envelope.receivedAt;
-    if (envelope.type === 'engine' && envelope.subtype === 'exit') existing.isLive = false;
     if (activity) existing.activity = activity;
-    // Normally set explicitly by the create/attach handlers before this
-    // ever runs — but their IPC response and this live push aren't
-    // strictly ordered, so backfill cwd if this session's first-seen
-    // event beat that response here.
     if (!existing.cwd && envelope.raw?.cwd) existing.cwd = envelope.raw.cwd;
+    if (!existing.transcriptPath && envelope.transcriptPath) existing.transcriptPath = envelope.transcriptPath;
   } else {
     state.sessions.set(envelope.sessionId, {
       sessionId: envelope.sessionId,
       cwd: envelope.raw?.cwd,
-      eventCount: 1,
-      createdAt: envelope.receivedAt,
+      transcriptPath: envelope.transcriptPath,
       lastEventAt: envelope.receivedAt,
-      isLive: true,
-      activity: activity || { label: 'Watching…', busy: false },
+      activity: activity || null,
     });
   }
   renderSessionList();
   if (state.selectedSession === DASHBOARD) renderDashboard();
-  if (state.selectedSession === envelope.sessionId) updateComposerVisibility();
 
   const sessionCwd = state.sessions.get(envelope.sessionId)?.cwd;
   if (sessionCwd) scheduleProjectPanelRefresh(sessionCwd);
@@ -700,85 +620,31 @@ function touchSession(envelope) {
 
 function handleLiveEvent(envelope) {
   touchSession(envelope);
-
-  if (envelope.type === 'stream_event') {
-    handleStreamEvent(envelope);
-    return;
-  }
-  if (envelope.type === 'assistant') {
-    finalizeAssistantMessage(envelope);
-    return;
-  }
-  if (isViewingSession(envelope.sessionId)) appendEventCard(envelope);
+  if (state.selectedSession === envelope.sessionId) appendEventCard(envelope);
 }
 
-async function loadInitialSessions() {
+async function refreshSessions() {
   const sessions = await window.viewerAPI.listSessions();
-  for (const s of sessions) state.sessions.set(s.sessionId, s);
+  for (const s of sessions) {
+    const existing = state.sessions.get(s.sessionId);
+    if (existing) {
+      if ((s.lastEventAt || '') > (existing.lastEventAt || '')) existing.lastEventAt = s.lastEventAt;
+      existing.cwd = existing.cwd || s.cwd;
+      existing.transcriptPath = existing.transcriptPath || s.transcriptPath;
+    } else {
+      state.sessions.set(s.sessionId, {
+        sessionId: s.sessionId,
+        cwd: s.cwd,
+        transcriptPath: s.transcriptPath,
+        lastEventAt: s.lastEventAt,
+        activity: null,
+      });
+    }
+  }
   renderSessionList();
+  if (state.selectedSession === DASHBOARD) renderDashboard();
 }
 
-function formatRelative(iso) {
-  const totalSeconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
-  if (totalSeconds < 60) return `${totalSeconds}s ago`;
-  const minutes = Math.floor(totalSeconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
-}
-
-async function loadDiscoverList() {
-  const items = await window.viewerAPI.discoverSessions();
-  el.discoverList.innerHTML = '';
-
-  if (items.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'discover-empty';
-    empty.textContent = 'No other Claude Code sessions found.';
-    el.discoverList.appendChild(empty);
-    return;
-  }
-
-  for (const item of items) {
-    const div = document.createElement('div');
-    div.className = 'discover-item';
-
-    const cwd = document.createElement('div');
-    cwd.className = 'cwd';
-    cwd.textContent = item.cwd;
-    div.appendChild(cwd);
-
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.textContent = `${item.sessionId.slice(0, 8)} · ${formatRelative(item.lastModified)}`;
-    div.appendChild(meta);
-
-    div.addEventListener('click', () => attachToDiscovered(item));
-    el.discoverList.appendChild(div);
-  }
-}
-
-async function attachToDiscovered(item) {
-  const data = await window.viewerAPI.attachSession(item);
-  state.sessions.set(data.sessionId, {
-    sessionId: data.sessionId,
-    cwd: item.cwd,
-    eventCount: 0,
-    createdAt: new Date().toISOString(),
-    isLive: true,
-    activity: { label: 'Watching…', busy: false },
-  });
-  await selectSession(data.sessionId);
-  loadDiscoverList();
-}
-
-el.detachBtn.addEventListener('click', async () => {
-  if (state.selectedSession === DASHBOARD || state.selectedSession === SETTINGS || state.selectedSession === PROJECT) return;
-  await window.viewerAPI.detachSession(state.selectedSession);
-});
-
-el.discoverRefreshBtn.addEventListener('click', loadDiscoverList);
 el.backToDashboardBtn.addEventListener('click', () => selectSession(DASHBOARD));
 el.projectBackBtn.addEventListener('click', () => selectSession(DASHBOARD));
 el.settingsBtn.addEventListener('click', () => selectSession(SETTINGS));
@@ -799,8 +665,15 @@ el.settingsSaveBtn.addEventListener('click', async () => {
 });
 
 (async () => {
-  await loadInitialSessions();
+  await refreshSessions();
   await selectSession(DASHBOARD);
 })();
-loadDiscoverList();
+
+// Liveness decays with time and new sessions can appear from a fresh
+// directory scan, so periodically re-sync and re-render whichever
+// overview is showing.
+setInterval(async () => {
+  await refreshSessions();
+}, 30000);
+
 window.viewerAPI.onEvent(handleLiveEvent);

@@ -6,14 +6,7 @@ files Claude Code already writes on its own — the per-session transcript
 for session data, and `~/.claude/settings.json` for the settings editor
 (reads to populate the editor; writes only when you explicitly hit Save).
 
-An earlier version spoke Claude Code's `stream-json` child-process
-protocol directly (the same one the Claude Agent SDK uses) to launch and
-drive sessions from the app. That capability was deliberately removed —
-this app doesn't instruct Claude Code, only watches it — so that protocol
-isn't documented here anymore; what follows is what the app actually
-reads today.
-
-## Transport: tailing a transcript file
+## Source of truth: the transcript files
 
 Claude Code keeps a durable, append-only transcript for **every**
 session, regardless of what started it, at:
@@ -22,19 +15,28 @@ session, regardless of what started it, at:
 ~/.claude/projects/<cwd, every "/" replaced with "-">/<session_id>.jsonl
 ```
 
-- `core/discover.js` scans that directory (most recently modified first)
-  so the app can offer a picker instead of requiring a path. It peeks at
-  the first ~8KB of each file for a `cwd` field (real value) rather than
-  trying to decode it from the hyphen-joined directory name (lossy if the
-  real path contains hyphens).
-- `core/tail.js` reads a chosen transcript from byte 0 — backfilling
-  everything Claude Code has logged so far — and then watches the file
-  for further writes (`fs.watch` + a tracked byte offset), parsing each
-  newly appended line the moment it lands. Same idea as `tail -f`,
-  implemented without a subprocess. There is no way to write back into
-  the file or the session — attaching is purely observational.
+(Override the root with `CLAUDE_VIEWER_PROJECTS_DIR`, mainly for tests.)
 
-## Message types in the transcript
+The app never maintains its own copy of this data:
+
+- `core/discover.js` — scans the directory (most recently modified
+  first) to enumerate sessions. It peeks at the first ~8KB of each file
+  for a `cwd` field (the real value) rather than decoding the
+  hyphen-joined directory name (lossy if the real path contains hyphens).
+  A session is "live" if its transcript was modified within the last
+  5 minutes (`LIVE_WINDOW_MS`) — liveness can't be read off a process
+  table, since the app never owns or even knows the claude processes.
+- `core/transcript.js` — parses a whole transcript into envelopes on
+  demand, whenever a session or project view needs history. Lines without
+  a `timestamp` field inherit the previous line's, which preserves
+  ordering.
+- `core/watch.js` — a single poller (every 2s) stats every transcript;
+  files that grew stream their appended lines, files that appeared stream
+  from byte 0. Polling is deliberate — recursive `fs.watch` is
+  inconsistent across platforms and quietly unreliable on some Windows
+  setups, and a stat pass over a few dozen files is negligible.
+
+## Message types in a transcript
 
 Captured from a real transcript, not invented:
 
@@ -48,65 +50,60 @@ Captured from a real transcript, not invented:
 | `mode`                | A mode/permission-state change |
 | `system`              | Occasional session-level notes (subtype varies) |
 
-There's no token-level granularity here (entries appear once Claude Code
-writes them, not as they're generated) and no explicit "turn result"
-message — the dashboard's activity line (`Running <tool>`, `Thinking…`,
-`Idle`, `Session ended`) is derived client-side from whichever of these
-messages arrived most recently (see `deriveActivity()` in
-`viewer/app.js`), not read directly off the wire.
+There's no token-level granularity (entries appear once Claude Code
+writes them) and no explicit "turn result" message — the dashboard's
+activity line (`Running <tool>`, `Processing tool result…`, `Idle`) is
+derived client-side from whichever of these arrived most recently
+(`deriveActivity()` in `viewer/app.js`), and the project view's stats and
+task roadmap are reduced from the full history (`computeProjectStats()`),
+including reconstructing the roadmap from `TaskCreate`/`TaskUpdate` tool
+calls — a task's numeric id only appears in `TaskCreate`'s result text
+(`"Task #7 created successfully: ..."`), so results are correlated back
+to their tool call via `tool_use_id`.
 
-## Envelope stored in SQLite / sent to the renderer
+## Envelope sent to the renderer
 
-The main process wraps each raw transcript line before storing/forwarding it:
+Every transcript line is wrapped (`core/transcript.js`) before being
+returned or pushed:
 
 ```jsonc
 {
   "protocolVersion": "2",
-  "eventId": "uuid",           // main-process-assigned
-  "sessionId": "...",          // Claude Code's own session_id
-  "receivedAt": "2026-07-11T05:20:00.000Z",
-  "type": "assistant",         // raw.type, passed through
-  "subtype": null,             // raw.subtype, passed through (often null)
+  "eventId": "uuid",            // viewer-assigned
+  "sessionId": "...",           // from the transcript's filename
+  "receivedAt": "2026-07-13T05:20:00.000Z", // line's own timestamp (history) or arrival time (live)
+  "type": "assistant",          // raw.type, passed through
+  "subtype": null,              // raw.subtype, passed through (often null)
+  "transcriptPath": "...",      // which file this came from
   "raw": { /* the exact parsed transcript line, untouched */ }
 }
 ```
 
 `raw` is never reshaped — new fields Claude Code adds show up immediately
-without a code change. One synthetic type is added by the main process
-itself, clearly namespaced so it's never confused with something Claude
-Code wrote: `engine` (`subtype`: `exit`, `stderr`, `unparsed_stdout`) —
-bookkeeping about the file watcher itself (an error reading the file, a
-line that failed to parse).
+without a code change.
 
 ## IPC surface (Electron main process ↔ renderer)
 
 The main process (`electron/main.cjs`) owns all filesystem access; the
-renderer (`viewer/`, running in a `BrowserWindow`) only calls the API
-`electron/preload.cjs` exposes on `window.viewerAPI`, which forwards to
-`ipcMain.handle` channels in the main process:
+renderer (`viewer/`) only calls `window.viewerAPI`
+(`electron/preload.cjs`), which forwards to `ipcMain.handle` channels:
 
-- `viewerAPI.discoverSessions()` → `sessions:discover` — scans
-  `~/.claude/projects` for transcripts not already being tracked, most
-  recently modified first.
-- `viewerAPI.attachSession({ sessionId, transcriptPath, cwd })` →
-  `sessions:attach` — starts tailing an existing transcript file.
-- `viewerAPI.detachSession(sessionId)` → `sessions:detach` — stops
-  tailing it (the underlying Claude Code session, if still running, is
-  never touched).
-- `viewerAPI.listSessions()` / `viewerAPI.getSessionEvents(sessionId)` →
-  `sessions:list` / `sessions:events` — history, backed by SQLite.
-- `viewerAPI.getEventsForProject(cwd)` → `sessions:eventsForCwd` — every
-  event from every session recorded under that `cwd`, in one query
-  (`core/db.js`'s `listEventsForCwd`); the renderer reduces this to the
-  project view's stats and task roadmap (`computeProjectStats()` in
-  `viewer/app.js`) rather than the main process precomputing them.
+- `viewerAPI.listSessions()` → `sessions:list` — a fresh directory scan:
+  `{ sessionId, cwd, transcriptPath, lastEventAt, isLive }` per session.
+- `viewerAPI.getSessionEvents(transcriptPath)` → `sessions:events` —
+  parses that transcript in full. The path is validated to resolve inside
+  the projects directory; anything else is rejected.
+- `viewerAPI.getEventsForProject(cwd)` → `sessions:eventsForCwd` — parses
+  every transcript whose `cwd` matches and returns the merged,
+  timestamp-sorted history.
 - `viewerAPI.readSettings()` → `settings:read` — reads
   `~/.claude/settings.json`, returning `{ path, contents, exists }`
   (`contents` is `"{}\n"` and `exists: false` if the file doesn't exist
   yet).
 - `viewerAPI.writeSettings(contents)` → `settings:write` — validates
   `contents` parses as a JSON object, then writes it verbatim; rejects
-  (and writes nothing) if it doesn't parse or isn't an object.
-- `viewerAPI.onEvent(callback)` — subscribes to `viewer:event`, which the
-  main process pushes (`mainWindow.webContents.send`) for every new
-  transcript line as it's ingested, no polling involved.
+  (and writes nothing) otherwise.
+- `viewerAPI.onEvent(callback)` — subscribes to `viewer:event`, pushed by
+  the main process for every newly appended transcript line anywhere
+  under the projects directory. No registration per session — new
+  sessions announce themselves.

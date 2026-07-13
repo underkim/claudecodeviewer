@@ -1,12 +1,12 @@
 # claudecodeviewer
 
 A desktop app for watching Claude Code work in real time on your local
-projects. It's **view-only by design**: it never launches a Claude Code
-session or sends it a prompt — it only attaches to sessions already
-running (a terminal, another tool, anywhere on the machine) and tails
-what they're doing. It also gives Claude Code's global settings
-(`~/.claude/settings.json`) a small in-app editor, since that file is
-otherwise hand-edited JSON with no UI at all.
+projects. Open it and every project and session on the machine is already
+there — no registration, no attach step, no server. It's **view-only by
+design**: it never launches a Claude Code session or sends it a prompt;
+it only reads the transcripts Claude Code itself writes. It also gives
+Claude Code's global settings (`~/.claude/settings.json`) a small in-app
+editor, since that file is otherwise hand-edited JSON with no UI at all.
 
 ## How it works
 
@@ -15,43 +15,54 @@ renderer (viewer/, in a BrowserWindow)
    |  window.viewerAPI.*  (IPC, via electron/preload.cjs)
    v
 electron/main.cjs  <--(reads, never writes)--  ~/.claude/projects/**/*.jsonl
-   |                                            (a session's own transcript)
-SQLite (core/db.js)
+                                                (every session's transcript)
 ```
 
-1. **Discovery & tailing** (`core/discover.js`, `core/tail.js`) — Claude
-   Code keeps a live, append-only transcript for every session, regardless
-   of what started it, at
-   `~/.claude/projects/<cwd, slashes as hyphens>/<session_id>.jsonl`.
-   `discover.js` scans that directory (most recently modified first) so
-   the app can offer a picker instead of requiring a path; `tail.js` reads
-   a chosen transcript from byte 0 and then follows further writes via
-   `fs.watch` — the same idea as `tail -f`, with no dependency on who
-   owns the underlying process, and no way to write back into it.
-2. **Main process** (`electron/main.cjs`) — owns the file watchers,
-   persists every message verbatim to SQLite (`core/db.js`), and pushes
-   each one to the renderer window the instant it arrives. It also reads
-   and writes `~/.claude/settings.json` for the settings editor.
-3. **Renderer** (`viewer/`) — the window contents. The default view is a
-   **dashboard**: one card per *project* (sessions grouped by working
-   directory — a project can have several, past or live), showing
-   whether anything's live and a one-line status derived from the
-   busiest session's latest events (`Running Bash`, `Thinking…`, `Idle`,
-   `Ended`, color-coded), updating live as events stream in. Click a card
-   for the **project view**: stat tiles (sessions, tool calls, files
-   touched, turns) and a tool-usage breakdown, a **roadmap** reconstructed
-   from the project's `TaskCreate`/`TaskUpdate` tool calls (a progress bar
-   plus each task's status), and the list of sessions under it — click
-   one of those for the full event timeline (tool calls, hook activity,
-   turn text as color-coded cards), read-only, with a Detach button. Back
-   buttons return to the dashboard at each level. The renderer never
-   touches the filesystem or watches files itself — everything goes
-   through `window.viewerAPI` (`electron/preload.cjs`), an IPC bridge
-   with no direct Node or OS access.
+Claude Code keeps a durable, append-only transcript for **every** session
+it runs, regardless of how it was started, at
+`~/.claude/projects/<cwd, slashes as hyphens>/<session_id>.jsonl`. Those
+files are this app's entire data model — the transcript *is* the
+database, so there is nothing to ingest, sync, or lose when the viewer
+wasn't running:
 
-See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full transcript
-message reference, captured from a real session, not a schema invented
-on top of it.
+1. **Discovery** (`core/discover.js`) — scans that directory to answer
+   "what sessions exist". A session whose transcript was written in the
+   last 5 minutes is shown as live.
+2. **History on demand** (`core/transcript.js`) — opening a session or
+   project view parses the relevant transcript file(s) right then. The
+   full history is always available, including everything that happened
+   while this app was closed.
+3. **Live updates** (`core/watch.js`) — one poller checks every
+   transcript for appended bytes every 2 seconds and pushes each new line
+   to the window as it lands; brand-new session files stream from byte 0
+   so new sessions pop onto the dashboard by themselves. Polling instead
+   of `fs.watch` is deliberate: recursive watch is inconsistent across
+   platforms and quietly unreliable on some Windows setups, and a stat
+   pass over a few dozen files is negligible.
+
+The renderer never touches the filesystem itself — everything goes
+through `window.viewerAPI` (`electron/preload.cjs`), an IPC bridge with
+no direct Node or OS access, and the main process refuses transcript
+paths outside the projects directory.
+
+## The views
+
+- **Dashboard** (default) — one card per *project* (sessions grouped by
+  working directory), each showing whether anything's live and a one-line
+  status derived from the latest transcript entries (`Running Bash`,
+  `Processing tool result…`, `Idle`), updating live.
+- **Project view** (click a card) — stat tiles (sessions, tool calls,
+  files touched, turns) with a per-tool usage breakdown, a **roadmap**
+  reconstructed from the project's own `TaskCreate`/`TaskUpdate` tool
+  calls (progress bar + status-sorted task list; says so plainly if the
+  project never used those tools), and its sessions.
+- **Session view** (click a session) — the full event timeline as
+  color-coded cards, each expandable to the raw JSON.
+- **⚙ Settings** — edits `~/.claude/settings.json` as raw JSON (a form
+  with fixed fields would go stale as Claude Code's settings schema
+  evolves, or silently drop keys it doesn't know). Save validates the
+  text parses as a JSON object before writing; anything else is rejected
+  without touching the file.
 
 ## Running it
 
@@ -60,70 +71,29 @@ npm install
 npm start
 ```
 
-This opens the app on the dashboard. Use "Attach to a running session" in
-the sidebar — Refresh to list recently active Claude Code sessions on
-this machine, click one to start tailing it. Its card appears on the
-dashboard immediately; click through for the detail view, or Detach to
-stop watching (this only stops the app's file watcher — the underlying
-Claude Code session is never touched).
+That's it — the dashboard fills in from `~/.claude/projects`
+automatically, and updates live while any Claude Code session is running
+anywhere on the machine.
 
-SQLite history is stored under `data/events.db` in the project directory
-(gitignored); override with `CLAUDE_VIEWER_DB`.
+Env overrides: `CLAUDE_VIEWER_PROJECTS_DIR` points discovery somewhere
+other than `~/.claude/projects` (used by the tests to run against a
+synthetic directory).
 
-## Project stats & roadmap
+## Why this shape?
 
-Clicking a dashboard card doesn't just replay the raw event log — it
-computes, across every session recorded under that working directory:
+This project changed shape several times before landing here, and the
+discarded designs explain the current one:
 
-- **Stats**: session count (and how many are live), total tool calls,
-  distinct files touched (from `file_path`/`path` on tool inputs), and
-  turn count, plus a breakdown of which tools were used how often.
-- **Roadmap**: Claude Code's own `TaskCreate`/`TaskUpdate` tool calls are
-  effectively a todo list already — `computeProjectStats()` in
-  `viewer/app.js` reconstructs it from the transcript (a task's numeric
-  id only appears in `TaskCreate`'s result text, e.g. `"Task #7 created
-  successfully: ..."`, so it's correlated back to the tool call via
-  `tool_use_id`) and shows it as a progress bar plus a status-sorted list
-  (`in_progress` → `pending` → `completed`). If a project's sessions
-  never used those tools, this section just says so — it's not invented.
-
-This is computed in the renderer from `viewerAPI.getEventsForProject(cwd)`
-(→ `sessions:eventsForCwd`, `core/db.js`), which pulls every event for
-every session sharing that `cwd` in one query; nothing beyond what's
-already in the transcripts is used.
-
-## Global settings editor
-
-The ⚙ Settings button opens a plain editor for
-`~/.claude/settings.json` (or the equivalent path on Windows/macOS via
-`os.homedir()`) — a raw JSON textarea rather than a form with fixed
-fields. That's deliberate: Claude Code's settings schema is large and
-changes over time, and a form baked in with today's known field names
-would go stale or, worse, silently drop fields it doesn't recognize.
-Reload re-reads the file (defaults to `{}` if it doesn't exist yet); Save
-validates the text is a JSON object before writing it back, and refuses
-to write anything else — you can't corrupt the file with a syntax
-mistake, but the app also isn't guessing at what belongs in it.
-
-## Why a desktop app, and why not hooks or spawning?
-
-Three design decisions worth knowing about, since this project changed
-shape twice before landing here:
-
-- **Desktop app, not a browser + server**: a browser tab can't watch
-  files or hold a pipe open to a CLI tool — only a real process with
-  Node/OS access can. Electron's main process *is* that process, so it
-  can do that directly and talk to the window over IPC, instead of
-  running an HTTP/WebSocket server on a port just to bridge browser
-  sandboxing.
-- **View-only, not a launcher**: earlier versions could also spawn a
-  `claude` process and send it prompts and follow-up messages. That's
-  gone — the app now only reads what Claude Code itself already wrote to
-  disk. It can't instruct Claude Code to do anything, by construction,
-  not just by convention.
-- **Tailing a transcript, not hooks**: an even earlier version used
-  Claude Code's hooks system — a script run as a subprocess per lifecycle
-  event, POSTing JSON to a server. It worked, but every "event" required
-  spawning a new process and a one-way HTTP call. Reading the transcript
-  Claude Code already keeps for every session is simpler and needs no
-  configuration on the session's side at all.
+- **Not hooks**: the first version registered Claude Code hooks that
+  POSTed JSON to a local server — one subprocess and HTTP call per event,
+  and per-project configuration before anything showed up.
+- **Not a spawner**: a later version launched `claude` as a child process
+  over its stream-json protocol and could drive it. Removed — this app
+  watches, it doesn't instruct, and that's enforced by construction (no
+  IPC channel can write to a session).
+- **Not a browser + server**: a browser tab can't read files; Electron's
+  main process can, and talks to the window over IPC instead of a port.
+- **Not a private database**: an earlier version ingested events into its
+  own SQLite while attached, which meant history only existed if the
+  viewer happened to be running and attached at the time. Reading the
+  transcripts directly means the app is correct the moment it opens.
