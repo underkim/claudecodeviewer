@@ -29,7 +29,9 @@ The app never maintains its own copy of this data:
 - `core/transcript.js` — parses a whole transcript into envelopes on
   demand, whenever a session or project view needs history. Lines without
   a `timestamp` field inherit the previous line's, which preserves
-  ordering.
+  ordering. Parsed results are cached keyed on the file's size+mtime
+  (safe for append-only files), so project-view refreshes only re-parse
+  transcripts that actually changed.
 - `core/watch.js` — a single poller (every 2s) stats every transcript;
   files that grew stream their appended lines, files that appeared stream
   from byte 0. Polling is deliberate — recursive `fs.watch` is

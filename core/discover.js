@@ -7,6 +7,13 @@ import os from 'node:os';
 export const PROJECTS_DIR =
   process.env.CLAUDE_VIEWER_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
 
+// A session's cwd never changes once its transcript exists, but discovery
+// runs on every watcher tick (every ~2s) — without this cache each tick
+// would open and read 8KB of every transcript on the machine. Only
+// successful peeks are cached: a just-created file may not have logged a
+// cwd-bearing line yet, and should be re-peeked until it has.
+const cwdCache = new Map(); // transcriptPath -> cwd
+
 // Every message in a transcript carries its own `cwd`, so peeking at the
 // first few KB (rather than decoding the lossy, hyphen-joined project
 // directory name) gets the real working directory.
@@ -34,6 +41,14 @@ function peekCwd(filePath) {
     }
   }
   return null;
+}
+
+function cachedCwd(filePath) {
+  const hit = cwdCache.get(filePath);
+  if (hit !== undefined) return hit;
+  const cwd = peekCwd(filePath);
+  if (cwd !== null) cwdCache.set(filePath, cwd);
+  return cwd;
 }
 
 /**
@@ -74,7 +89,7 @@ export function discoverSessions() {
       results.push({
         sessionId: file.replace(/\.jsonl$/, ''),
         transcriptPath: filePath,
-        cwd: peekCwd(filePath) || dirEnt.name.replace(/^-/, '/').replace(/-/g, '/'),
+        cwd: cachedCwd(filePath) || dirEnt.name.replace(/^-/, '/').replace(/-/g, '/'),
         lastModified: stat.mtime.toISOString(),
         sizeBytes: stat.size,
       });

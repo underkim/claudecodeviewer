@@ -359,6 +359,13 @@ header h1 {
 }
 .event-card.expanded .event-payload { display: block; }
 
+.timeline-notice {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  padding: 6px 0 10px;
+}
+
 #project-panel {
   display: flex;
   flex-direction: column;

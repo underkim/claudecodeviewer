@@ -19,6 +19,14 @@ export function wrapEnvelope(sessionId, raw, receivedAt, transcriptPath) {
   };
 }
 
+// The project view re-reads a whole project's history on every refresh
+// (debounced to ~0.4s while events stream in), and transcripts can be
+// megabytes. Parsed results are cached keyed on the file's size+mtime —
+// append-only files make that a safe fingerprint — so a refresh only
+// re-parses transcripts that actually changed.
+const parseCache = new Map(); // transcriptPath -> { size, mtimeMs, events }
+const PARSE_CACHE_MAX = 24;
+
 /**
  * Parses a whole transcript file into envelopes, on demand. History is
  * read straight from the file every time a view needs it — the transcript
@@ -31,6 +39,18 @@ export function wrapEnvelope(sessionId, raw, receivedAt, transcriptPath) {
  * which is already guaranteed by file position within one session.
  */
 export function readTranscriptEvents(transcriptPath) {
+  let stat;
+  try {
+    stat = fs.statSync(transcriptPath);
+  } catch {
+    return [];
+  }
+
+  const cached = parseCache.get(transcriptPath);
+  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+    return cached.events;
+  }
+
   let text;
   try {
     text = fs.readFileSync(transcriptPath, 'utf8');
@@ -39,12 +59,7 @@ export function readTranscriptEvents(transcriptPath) {
   }
 
   const sessionId = sessionIdFromPath(transcriptPath);
-  let fallbackTs;
-  try {
-    fallbackTs = fs.statSync(transcriptPath).mtime.toISOString();
-  } catch {
-    fallbackTs = new Date().toISOString();
-  }
+  const fallbackTs = stat.mtime.toISOString();
 
   const events = [];
   let lastTs = null;
@@ -59,5 +74,10 @@ export function readTranscriptEvents(transcriptPath) {
     if (raw.timestamp) lastTs = raw.timestamp;
     events.push(wrapEnvelope(sessionId, raw, lastTs || fallbackTs, transcriptPath));
   }
+
+  if (parseCache.size >= PARSE_CACHE_MAX && !parseCache.has(transcriptPath)) {
+    parseCache.delete(parseCache.keys().next().value);
+  }
+  parseCache.set(transcriptPath, { size: stat.size, mtimeMs: stat.mtimeMs, events });
   return events;
 }

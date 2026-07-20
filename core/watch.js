@@ -16,23 +16,23 @@ import { sessionIdFromPath } from './transcript.js';
  * Reliability beats latency here.
  */
 export function watchProjects({ onMessage, intervalMs = 2000 }) {
-  /** @type {Map<string, { offset: number, buffer: string }>} */
+  /** @type {Map<string, { offset: number, pending: Buffer }>} */
   const files = new Map();
 
   for (const s of discoverSessions()) {
-    files.set(s.transcriptPath, { offset: s.sizeBytes, buffer: '' });
+    files.set(s.transcriptPath, { offset: s.sizeBytes, pending: Buffer.alloc(0) });
   }
 
   function drainFile(transcriptPath, size) {
     let st = files.get(transcriptPath);
     if (!st) {
-      st = { offset: 0, buffer: '' };
+      st = { offset: 0, pending: Buffer.alloc(0) };
       files.set(transcriptPath, st);
     }
     if (size < st.offset) {
       // Truncated/replaced (e.g. /clear rewrote it) — start over.
       st.offset = 0;
-      st.buffer = '';
+      st.pending = Buffer.alloc(0);
     }
     if (size === st.offset) return;
 
@@ -43,7 +43,7 @@ export function watchProjects({ onMessage, intervalMs = 2000 }) {
         const len = size - st.offset;
         const buf = Buffer.alloc(len);
         const bytesRead = fs.readSync(fd, buf, 0, len, st.offset);
-        chunk = buf.toString('utf8', 0, bytesRead);
+        chunk = buf.subarray(0, bytesRead);
         st.offset += bytesRead;
       } finally {
         fs.closeSync(fd);
@@ -52,11 +52,17 @@ export function watchProjects({ onMessage, intervalMs = 2000 }) {
       return; // transient read failure — retry next tick
     }
 
-    st.buffer += chunk;
+    // Split on newline at the BYTE level and only decode complete lines.
+    // A poll boundary can land mid-way through a multi-byte UTF-8
+    // character (e.g. Korean text); decoding each chunk independently
+    // would corrupt that character on both sides and lose the line.
+    // 0x0A never occurs inside a multi-byte UTF-8 sequence, so byte-level
+    // splitting is safe.
+    st.pending = st.pending.length === 0 ? chunk : Buffer.concat([st.pending, chunk]);
     let idx;
-    while ((idx = st.buffer.indexOf('\n')) !== -1) {
-      const line = st.buffer.slice(0, idx);
-      st.buffer = st.buffer.slice(idx + 1);
+    while ((idx = st.pending.indexOf(0x0a)) !== -1) {
+      const line = st.pending.subarray(0, idx).toString('utf8');
+      st.pending = st.pending.subarray(idx + 1);
       if (!line.trim()) continue;
       try {
         onMessage(sessionIdFromPath(transcriptPath), JSON.parse(line), transcriptPath);
@@ -64,11 +70,21 @@ export function watchProjects({ onMessage, intervalMs = 2000 }) {
         // Corrupt line — skip it rather than stall the watcher.
       }
     }
+    // Detach the leftover partial line from the big chunk buffer so we
+    // don't pin the whole read in memory until the line completes.
+    if (st.pending.length > 0) st.pending = Buffer.from(st.pending);
   }
 
   function tick() {
+    const seen = new Set();
     for (const s of discoverSessions()) {
+      seen.add(s.transcriptPath);
       drainFile(s.transcriptPath, s.sizeBytes);
+    }
+    // Forget files that no longer exist (deleted transcripts) so the
+    // map doesn't grow forever.
+    for (const p of files.keys()) {
+      if (!seen.has(p)) files.delete(p);
     }
   }
 

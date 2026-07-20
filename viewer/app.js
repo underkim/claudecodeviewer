@@ -64,7 +64,7 @@ function formatTime(iso) {
 
 function formatRelative(iso) {
   if (!iso) return '';
-  const totalSeconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  const totalSeconds = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
   if (totalSeconds < 60) return `${totalSeconds}s ago`;
   const minutes = Math.floor(totalSeconds / 60);
   if (minutes < 60) return `${minutes}m ago`;
@@ -254,10 +254,17 @@ function sortedSessions() {
   );
 }
 
+// A machine can accumulate hundreds of sessions over time; the sidebar
+// is for quick navigation, not an archive, so cap it. Older sessions
+// stay reachable through their project's session list.
+const SIDEBAR_MAX_SESSIONS = 50;
+
 function renderSessionList() {
   el.sessions.innerHTML = '';
   el.sessions.appendChild(buildSessionItem({ sessionId: DASHBOARD, label: 'Dashboard' }));
-  for (const s of sortedSessions()) el.sessions.appendChild(buildSessionItem(s));
+  for (const s of sortedSessions().slice(0, SIDEBAR_MAX_SESSIONS)) {
+    el.sessions.appendChild(buildSessionItem(s));
+  }
 }
 
 function buildSessionItem(s) {
@@ -545,7 +552,18 @@ async function selectSession(sessionId) {
 
   if (session?.transcriptPath) {
     const events = await window.viewerAPI.getSessionEvents(session.transcriptPath);
-    for (const e of events) appendEventCard(e);
+    // Long sessions can have thousands of transcript lines; rendering a
+    // DOM card for each makes the view sluggish for no benefit — the
+    // recent end is what a viewer needs.
+    const MAX_TIMELINE_EVENTS = 300;
+    const start = Math.max(0, events.length - MAX_TIMELINE_EVENTS);
+    if (start > 0) {
+      const notice = document.createElement('div');
+      notice.className = 'timeline-notice';
+      notice.textContent = `Showing the last ${MAX_TIMELINE_EVENTS} of ${events.length} events`;
+      el.timeline.appendChild(notice);
+    }
+    for (const e of events.slice(start)) appendEventCard(e);
     el.timeline.scrollTop = el.timeline.scrollHeight;
   }
 }
@@ -625,7 +643,9 @@ function handleLiveEvent(envelope) {
 
 async function refreshSessions() {
   const sessions = await window.viewerAPI.listSessions();
+  const scanned = new Set();
   for (const s of sessions) {
+    scanned.add(s.sessionId);
     const existing = state.sessions.get(s.sessionId);
     if (existing) {
       if ((s.lastEventAt || '') > (existing.lastEventAt || '')) existing.lastEventAt = s.lastEventAt;
@@ -640,6 +660,12 @@ async function refreshSessions() {
         activity: null,
       });
     }
+  }
+  // Drop sessions whose transcript no longer exists (deleted/cleaned up),
+  // but never one with recent live events — its file may simply have been
+  // created after this scan's snapshot.
+  for (const [id, s] of state.sessions) {
+    if (!scanned.has(id) && !isSessionLive(s)) state.sessions.delete(id);
   }
   renderSessionList();
   if (state.selectedSession === DASHBOARD) renderDashboard();
